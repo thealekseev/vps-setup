@@ -6,7 +6,6 @@
 #  Репозиторий: https://github.com/thealekseev/vps-setup
 # ============================================================
 
-# Строгий режим: необъявленные переменные и ошибки в конвейерах прерывают выполнение
 set -uo pipefail
 
 # ---------- Цвета для вывода ----------
@@ -16,22 +15,14 @@ BLUE='\033[0;34m';  CYAN='\033[0;36m';   NC='\033[0m'
 # ---------- Логирование ----------
 LOG_FILE="/var/log/server-hardening.log"
 
-# Сохраняем оригинальные дескрипторы stdout/stderr в FD 3 и 4.
-# FD 3 — это «настоящий» терминал пользователя, в обход tee.
-# Он нужен для живого спиннера: спиннер пишет прямо в терминал,
-# не засоряя лог.
 exec 3>&1 4>&2
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-# Определяем, есть ли у нас интерактивный терминал.
-# Если да — используем спиннер в терминале. Если нет (curl|bash в CI,
-# перенаправление в файл) — используем периодические сообщения в лог.
 SPINNER_ENABLED=0
 if [ -t 3 ]; then
     SPINNER_ENABLED=1
 fi
 
-# Засекаем старт скрипта для итогового отчёта.
 SCRIPT_START=$(date +%s)
 
 log()  { echo -e "${GREEN}[+]${NC} $*"; }
@@ -39,19 +30,13 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[x]${NC} $*"; }
 info() { echo -e "${BLUE}[i]${NC} $*"; }
 
-# Глобальный обработчик ошибок: выводит номер строки и инструкцию
-# по восстановлению, чтобы скрипт не завершался молча при сбоях.
 trap 'err "Непредвиденная ошибка в строке $LINENO. Лог: $LOG_FILE. Соединение НЕ перезапущено. Проверьте: sshd -t"' ERR
 
 # ---------- Управление шагами ----------
 STEP=0; TOTAL_STEPS=10; START_TIME=0
 
 step_start() {
-    # Арифметическое присваивание вместо ((STEP++)) — иначе при STEP=0
-    # возвращается exit code 1 и ложно срабатывает trap ERR.
     STEP=$((STEP + 1))
-
-    # Прогресс-бар: 20 символов, заполнение пропорционально STEP.
     local width=20
     local filled=$(( STEP * width / TOTAL_STEPS ))
     local percent=$(( STEP * 100 / TOTAL_STEPS ))
@@ -59,14 +44,12 @@ step_start() {
     for ((i=0; i<width; i++)); do
         if [ "$i" -lt "$filled" ]; then bar+="█"; else bar+="░"; fi
     done
-
     echo -e "\n${BLUE}============================================================${NC}"
     echo -e "${BLUE}  [$STEP/$TOTAL_STEPS] ${GREEN}${bar}${NC} ${YELLOW}${percent}%${NC} $1${NC}"
     echo -e "${BLUE}============================================================${NC}"
     START_TIME=$(date +%s)
 }
 
-# Heartbeat: фоновый индикатор жизни.
 _heartbeat() {
     local desc="$1"
     local start="$2"
@@ -74,7 +57,6 @@ _heartbeat() {
     local now elapsed
     local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
     local n=${#frames[@]}
-
     while :; do
         if [ "$SPINNER_ENABLED" -eq 1 ]; then
             now=$(date +%s)
@@ -100,24 +82,17 @@ _heartbeat() {
 run_timed() {
     local desc="$1"; shift
     local start end rc hb_pid
-
     echo -e "  ${CYAN}↳${NC} $desc"
     start=$(date +%s)
-
     _heartbeat "$desc" "$start" &
     hb_pid=$!
-
-    # Вывод команды идёт НАПРЯМУЮ в лог-файл, минуя tee.
     "$@" >> "$LOG_FILE" 2>&1
     rc=$?
-
     kill "$hb_pid" 2>/dev/null
     wait "$hb_pid" 2>/dev/null || true
-
     if [ "$SPINNER_ENABLED" -eq 1 ]; then
         printf '\r\033[K' >&3 2>/dev/null || true
     fi
-
     end=$(date +%s)
     if [ "$rc" -eq 0 ]; then
         echo -e "  ${GREEN}✓${NC} $desc — $((end - start)) сек."
@@ -139,10 +114,6 @@ confirm() {
     [[ "$answer" =~ ^[Yy]$ ]]
 }
 
-# pad_right «строка» «ширина»
-# Возвращает строку, добитую пробелами справа до нужной ШИРИНЫ В СИМВОЛАХ.
-# Стандартный printf "%-Ns" считает БАЙТЫ, поэтому кириллица в UTF-8
-# (2 байта на символ) ломает выравнивание. ${#var} в UTF-8 локали — символы.
 pad_right() {
     local s="$1" width="$2"
     local padding=$(( width - ${#s} ))
@@ -170,9 +141,6 @@ validate_username() {
     return 0
 }
 
-# Читает эффективное значение параметра из sshd_config.
-# `sshd -T` учитывает Include и drop-in файлы. Может вернуть non-zero
-# при warnings в конфиге — для нас это чисто информационный вызов.
 sshd_current() {
     local key="$1"
     local val=""
@@ -190,13 +158,10 @@ service_restart_or_reload_ssh() {
     else
         err "Не найден сервис ssh/sshd"; return 1
     fi
-
     sshd -t || { err "sshd -t не проходит. Перезапуск отменён."; return 1; }
-
     if systemctl reload "$unit" 2>/dev/null; then
         log "SSH перезагружен (reload, $unit)"; return 0
     fi
-
     err "reload не удался, пробуем restart..."
     systemctl restart "$unit" && { log "SSH перезапущен (restart, $unit)"; return 0; }
     err "Не удалось перезапустить SSH!"; return 1
@@ -214,17 +179,14 @@ get_public_ip() {
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     err "Запустите скрипт от имени root"; exit 1
 fi
-
 [ -f /etc/os-release ] || { err "/etc/os-release отсутствует"; exit 1; }
 # shellcheck disable=SC1091
 . /etc/os-release
 OS_ID="${ID:-unknown}"; OS_VER="${VERSION_ID:-unknown}"
-
 case "$OS_ID" in
     ubuntu|debian) : ;;
     *) warn "ОС '$OS_ID' не тестировалась"; confirm "Продолжить?" || exit 1 ;;
 esac
-
 log "ОС: ${PRETTY_NAME:-$OS_ID $OS_VER}"
 export DEBIAN_FRONTEND=noninteractive
 
@@ -236,17 +198,17 @@ done
 # ============================================================
 #  1. Предварительный анализ системы
 # ============================================================
-# Здесь мы ТОЛЬКО читаем текущее состояние и показываем его пользователю.
-# Ничего не меняется. Все команды — информационные, поэтому защищены
-# `|| true` (любая из них может вернуть non-zero, и trap ERR сработал бы
-# ложно).
 step_start "Предварительный анализ системы"
 
 CUR_SSH_PORT="$(sshd_current port || true)";  CUR_SSH_PORT="${CUR_SSH_PORT:-22}"
 CUR_PERMIT_ROOT_LOGIN="$(sshd_current permitrootlogin || true)"
 CUR_PASSWORD_AUTH="$(sshd_current passwordauthentication || true)"
 CUR_PUBKEY_AUTH="$(sshd_current pubkeyauthentication || true)"
-CUR_ALLOW_USERS="$(sshd -T 2>/dev/null | awk '$1=="allowusers" {print $0; exit}' || true)"
+
+# sshd -T выдаёт строку вида "allowusers user1 user2" — нам нужно только
+# значение, без имени директивы.
+CUR_ALLOW_USERS="$(sshd -T 2>/dev/null \
+    | awk '$1=="allowusers" {$1=""; sub(/^ +/,""); print; exit}' || true)"
 
 CUR_KEYS_ROOT="нет"
 [ -s /root/.ssh/authorized_keys ] && CUR_KEYS_ROOT="есть"
@@ -347,7 +309,6 @@ step_done
 #  4. Swap и время
 # ============================================================
 step_start "Swap и время"
-# Портативная проверка наличия активного swap.
 if ! swapon --show 2>/dev/null | grep -q .; then
     warn "Swap не найден. Создаём файл подкачки 2GB..."
     fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048
@@ -359,16 +320,12 @@ else
 fi
 
 # --- Часовой пояс ---
-# Показываем текущий TZ, предлагаем сменить. Список популярных зон +
-# возможность ввести вручную. Валидируем через timedatectl list-timezones.
 if command -v timedatectl >/dev/null 2>&1; then
     CUR_TZ_NOW="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
     CUR_TZ_NOW="${CUR_TZ_NOW:-UTC}"
     info "Текущий часовой пояс: ${CUR_TZ_NOW}"
 
     if confirm "Сменить часовой пояс?"; then
-        # Формируем список: текущий TZ первым, TZ из env (если есть),
-        # затем популярные зоны. Дубликаты не добавляем.
         declare -a TZ_CHOICES=()
         TZ_CHOICES+=("${CUR_TZ_NOW}")
         if [ -n "${TZ:-}" ] && [ "$TZ" != "$CUR_TZ_NOW" ]; then
@@ -456,7 +413,7 @@ systemctl enable --now chrony 2>/dev/null \
 step_done
 
 # ============================================================
-#  5. SSH hardening — планирование и применение
+#  5. SSH hardening
 # ============================================================
 step_start "SSH hardening"
 
@@ -507,7 +464,7 @@ if confirm "Создать non-root пользователя с правами s
     fi
 fi
 
-# --- 5.2. Управление SSH-ключами ---
+# --- 5.2. SSH-ключи ---
 HAS_KEYS=0
 [ -s /root/.ssh/authorized_keys ] && HAS_KEYS=1
 for d in /home/*/.ssh; do
@@ -516,9 +473,6 @@ done
 
 DISABLE_PASSWORD="no"
 if [ "$HAS_KEYS" -eq 1 ]; then
-    # Ключи найдены → согласно политике отключаем вход по паролю.
-    # Пользователь увидит это в ПЛАНЕ ИЗМЕНЕНИЙ SSH ниже и может
-    # отклонить весь план целиком, ответив "n".
     DISABLE_PASSWORD="yes"
     info "Найдены SSH-ключи → PasswordAuthentication будет отключён."
     warn "Проверьте ДО применения, что вход по ключу работает:"
@@ -527,17 +481,14 @@ else
     warn "SSH-ключи не найдены!"
     if confirm "Сгенерировать новый ed25519-ключ?"; then
         mkdir -p /root/.ssh; chmod 700 /root/.ssh
-
         if [ ! -f /root/.ssh/id_ed25519 ]; then
             ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N "" \
                 -C "root@$(hostname)" </dev/null >/dev/null 2>&1
         else
             info "Ключ /root/.ssh/id_ed25519 уже существует — используем его."
         fi
-
         cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
         chmod 600 /root/.ssh/authorized_keys
-
         KEY_FILE="/root/GENERATED_PRIVATE_KEY.txt"
         cp /root/.ssh/id_ed25519 "$KEY_FILE"; chmod 400 "$KEY_FILE"
         echo ""
@@ -546,7 +497,6 @@ else
         echo -e "${RED}  СКОПИРУЙТЕ его и удалите файл после настройки клиента!${NC}"
         echo -e "${RED}===========================================================${NC}"
         echo ""
-
         if confirm "Вы скопировали ключ и готовы отключить вход по паролю?"; then
             DISABLE_PASSWORD="yes"
             if [ -n "$NEW_USER" ] && [ ! -s "/home/${NEW_USER}/.ssh/authorized_keys" ]; then
@@ -560,7 +510,7 @@ else
     fi
 fi
 
-# --- 5.3. Смена порта SSH (планирование) ---
+# --- 5.3. Смена порта ---
 NEW_SSH_PORT=""
 if confirm "Сменить стандартный SSH-порт (22)?"; then
     for _ in $(seq 1 20); do
@@ -595,8 +545,18 @@ else
     fi
 fi
 
+# ВАЖНО: в конфиге sshd PasswordAuthentication — это отдельное значение
+# ("yes"/"no"). Наш флаг DISABLE_PASSWORD="yes" означает «отключить пароль»,
+# то есть в конфиг должно попасть "no". Держим соответствие явно, чтобы
+# не путать флаг и значение директивы.
+if [ "$DISABLE_PASSWORD" = "yes" ]; then
+    FINAL_PASSWORD_AUTH="no"
+else
+    FINAL_PASSWORD_AUTH="yes"
+fi
+
 # ============================================================
-#  5.5. ПЛАН ИЗМЕНЕНИЙ SSH — показываем ДО применения
+#  5.5. ПЛАН ИЗМЕНЕНИЙ SSH
 # ============================================================
 echo ""
 echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
@@ -621,15 +581,20 @@ else
     echo -e "  $(pad_right 'PermitRootLogin' 24)${CUR_PERMIT_ROOT_LOGIN:-?} → ${ROOT_LOGIN_VAL}"
 fi
 
-if [ "$CUR_PASSWORD_AUTH" = "$DISABLE_PASSWORD" ]; then
-    echo -e "  $(pad_right 'PasswordAuthentication' 24)${DISABLE_PASSWORD} (без изменений)"
+if [ "$CUR_PASSWORD_AUTH" = "$FINAL_PASSWORD_AUTH" ]; then
+    echo -e "  $(pad_right 'PasswordAuthentication' 24)${FINAL_PASSWORD_AUTH} (без изменений)"
 else
-    echo -e "  $(pad_right 'PasswordAuthentication' 24)${CUR_PASSWORD_AUTH:-?} → ${DISABLE_PASSWORD}"
+    echo -e "  $(pad_right 'PasswordAuthentication' 24)${CUR_PASSWORD_AUTH:-?} → ${FINAL_PASSWORD_AUTH}"
 fi
 
 if [ -n "$NEW_USER" ]; then
-    CUR_ALLOW="${CUR_ALLOW_USERS:-<все>}"
-    echo -e "  $(pad_right 'AllowUsers' 24)${CUR_ALLOW} → ${NEW_USER}"
+    if [ -z "$CUR_ALLOW_USERS" ]; then
+        echo -e "  $(pad_right 'AllowUsers' 24)<все> → ${NEW_USER}"
+    elif [ "$CUR_ALLOW_USERS" = "$NEW_USER" ]; then
+        echo -e "  $(pad_right 'AllowUsers' 24)${NEW_USER} (без изменений)"
+    else
+        echo -e "  $(pad_right 'AllowUsers' 24)${CUR_ALLOW_USERS} → ${NEW_USER}"
+    fi
 fi
 
 echo -e "  ────────────────────────────────────────────────────────"
@@ -677,7 +642,7 @@ cat > "$HARDENING_CONF" <<EOF
 
 # Аутентификация
 PermitRootLogin ${ROOT_LOGIN_VAL}
-PasswordAuthentication ${DISABLE_PASSWORD}
+PasswordAuthentication ${FINAL_PASSWORD_AUTH}
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 MaxAuthTries 3
@@ -718,7 +683,7 @@ log "sshd -t OK (конфиг записан, но ещё не применён)
 step_done
 
 # ============================================================
-#  6. UFW — подготовка правил без включения
+#  6. UFW
 # ============================================================
 step_start "Подготовка правил UFW"
 
@@ -741,7 +706,6 @@ CURRENT_SSH_PORT=""
 if [ -n "${SSH_CONNECTION:-}" ]; then
     CURRENT_SSH_PORT=$(echo "$SSH_CONNECTION" | awk '{print $4}')
 fi
-
 if [ -z "$CURRENT_SSH_PORT" ]; then
     CURRENT_SSH_PORT=$(ss -tn state established 2>/dev/null \
         | awk '{print $4}' \
@@ -899,7 +863,7 @@ echo -e "  • IP (IPv4):               ${GREEN}${PUBLIC_IP}${NC}"
 echo -e "  • SSH-порт:                ${RED}${FINAL_PORT}${NC}"
 echo -e "  • Пользователь:            ${GREEN}${FINAL_USER}${NC}"
 echo -e "  • Root login:              ${RED}${ROOT_LOGIN_VAL}${NC}"
-echo -e "  • Password auth:           ${RED}${DISABLE_PASSWORD}${NC}"
+echo -e "  • PasswordAuthentication:  ${RED}${FINAL_PASSWORD_AUTH}${NC}"
 echo -e "  • Часовой пояс:            ${GREEN}${FINAL_TZ}${NC}"
 echo -e "  • Лог:                     ${LOG_FILE}"
 
@@ -994,8 +958,5 @@ else
 fi
 echo ""
 
-# ============================================================
-# Корректное завершение логирования.
-# ============================================================
 exec 1>&3 2>&1
 wait 2>/dev/null || true
