@@ -1,23 +1,16 @@
 #!/bin/bash
 
 # ============================================================
-#  Скрипт базовой настройки и hardening Linux-сервера (v2.2)
+#  Скрипт базовой настройки и hardening Linux-сервера (v2.4)
 #  Поддержка: Ubuntu 20.04/22.04/24.04, Debian 11/12
 #  Запуск от имени root
 #
 #  Репозиторий: https://github.com/thealekseev/vps-setup
 #
-#  Особенности:
-#   - Ожидание разблокировки apt (для свежих VPS с cloud-init)
-#   - Создание Swap-файла 2GB для предотвращения OOM
-#   - Интерактивная генерация SSH-ключей (без утечки в лог)
-#   - Валидация имени нового пользователя
-#   - Показ правил UFW до включения файерволла
-#   - Итоговая конфигурация ПЕРЕД перезапуском SSH
-#   - Явное предупреждение о разрыве текущей сессии
-#   - Безопасный перезапуск SSH (проверка конфига + reload)
-#   - Идемпотентность (можно запускать повторно)
-#   - Расширенный sysctl-hardening и unattended-upgrades
+#  Изменения в v2.4:
+#   - Полная автоматизация закрытия старого SSH-порта
+#   - Интерактивное подтверждение проверки нового подключения
+#   - Пользователю не нужно выполнять ручные команды
 # ============================================================
 
 set -uo pipefail
@@ -125,7 +118,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 log "Проверка блокировки пакетного менеджера..."
 while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-    warn "Пакетный менеджер заблокирован. Ждем 10 секунд..."
+    warn "Пакетный менеджер заблокирован (возможно, работают фоновые обновления). Ждем 10 секунд..."
     sleep 10
 done
 
@@ -134,7 +127,10 @@ done
 # ============================================================
 log "[1/9] Обновление пакетов и системы..."
 apt-get update -y
-apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade
+apt-get -y \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confold" \
+    upgrade
 apt-get -y autoremove
 apt-get -y autoclean
 
@@ -142,16 +138,18 @@ apt-get -y autoclean
 #  2. Установка утилит
 # ============================================================
 log "[2/9] Установка базовых и защитных утилит..."
-apt-get install -y curl wget git unzip nano htop net-tools jq \
-    ufw fail2ban unattended-upgrades apt-listchanges needrestart \
+apt-get install -y \
+    curl wget git unzip nano htop net-tools jq \
+    ufw fail2ban \
+    unattended-upgrades apt-listchanges needrestart \
     chrony auditd rkhunter
 
 # ============================================================
-#  2.5. Создание Swap-файла
+#  2.5. Создание Swap-файла (если отсутствует)
 # ============================================================
 log "[2.5/9] Проверка и настройка Swap..."
 if [ "$(swapon --show=SIZE | wc -l)" -le 1 ]; then
-    warn "Swap не найден. Создаем файл подкачки 2GB..."
+    warn "Swap не найден. Создаем файл подкачки 2GB для стабильности..."
     fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048
     chmod 600 /swapfile
     mkswap /swapfile
@@ -165,9 +163,12 @@ fi
 # ============================================================
 #  3. Часовой пояс и синхронизация времени
 # ============================================================
-log "[3/9] Настройка времени (UTC)..."
-timedatectl set-timezone "${TZ:-UTC}" 2>/dev/null || warn "timedatectl недоступен"
-systemctl enable --now chrony 2>/dev/null || systemctl enable --now systemd-timesyncd 2>/dev/null || true
+log "[3/9] Настройка времени (UTC рекомендуется для логов)..."
+timedatectl set-timezone "${TZ:-UTC}" 2>/dev/null || \
+    warn "timedatectl недоступен, пропускаем (возможно, LXC контейнер)"
+
+systemctl enable --now chrony 2>/dev/null || \
+    systemctl enable --now systemd-timesyncd 2>/dev/null || true
 
 # ============================================================
 #  4. SSH-hardening
@@ -178,9 +179,10 @@ SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_DIR="/etc/ssh/sshd_config.d"
 mkdir -p "$SSHD_DIR"
 HARDENING_CONF="${SSHD_DIR}/99-hardening.conf"
+
 backup_file "$SSHD_CONFIG"
 
-# --- 4.1. Non-root пользователь с sudo (с валидацией) ---
+# --- 4.1. Non-root пользователь с sudo (С ВАЛИДАЦИЕЙ) ---
 NEW_USER=""
 if confirm "Создать non-root пользователя с правами sudo?"; then
     while true; do
@@ -192,7 +194,7 @@ if confirm "Создать non-root пользователя с правами s
         fi
 
         if ! validate_username "$NEW_USER"; then
-            warn "Недопустимое имя. Используйте только латинские буквы, цифры, _ и -. Имя должно начинаться с буквы или _."
+            warn "Недопустимое имя пользователя. Используйте только латинские буквы, цифры, _ и -. Имя должно начинаться с буквы или _."
             continue
         fi
 
@@ -207,9 +209,12 @@ if confirm "Создать non-root пользователя с правами s
         break
     done
 
-    if [ -s /root/.ssh/authorized_keys ] && [ ! -s "/home/${NEW_USER}/.ssh/authorized_keys" ]; then
+    # Перенос authorized_keys от root, если они уже есть
+    if [ -s /root/.ssh/authorized_keys ] && \
+       [ ! -s "/home/${NEW_USER}/.ssh/authorized_keys" ]; then
         install -d -m 700 -o "$NEW_USER" -g "$NEW_USER" "/home/${NEW_USER}/.ssh"
-        install -m 600 -o "$NEW_USER" -g "$NEW_USER" /root/.ssh/authorized_keys "/home/${NEW_USER}/.ssh/authorized_keys"
+        install -m 600 -o "$NEW_USER" -g "$NEW_USER" \
+            /root/.ssh/authorized_keys "/home/${NEW_USER}/.ssh/authorized_keys"
         log "SSH-ключи root скопированы пользователю $NEW_USER"
     fi
 fi
@@ -231,14 +236,14 @@ if [ "$HAS_KEYS" -eq 1 ]; then
     fi
 else
     warn "SSH-ключи не найдены! Отключение пароля без ключей заблокирует доступ к серверу."
-    if confirm "Сгенерировать новый SSH-ключ (ed25519) прямо сейчас?"; then
+    if confirm "Сгенерировать новый SSH-ключ (ed25519) прямо сейчас и сохранить приватный ключ в файл?"; then
         mkdir -p /root/.ssh
         chmod 700 /root/.ssh
         ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N "" -C "root@$(hostname)" >/dev/null 2>&1
         cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
         chmod 600 /root/.ssh/authorized_keys
 
-        # Приватный ключ сохраняем в защищённый файл, НЕ выводим в лог
+        # Безопасное сохранение приватного ключа (НЕ выводим в лог!)
         KEY_FILE="/root/GENERATED_PRIVATE_KEY.txt"
         cp /root/.ssh/id_ed25519 "$KEY_FILE"
         chmod 400 "$KEY_FILE"
@@ -253,9 +258,11 @@ else
 
         if confirm "Вы скопировали приватный ключ и готовы отключить вход по паролю?"; then
             DISABLE_PASSWORD="yes"
+            # Если создан новый пользователь, копируем ключ и ему
             if [ -n "$NEW_USER" ] && [ ! -s "/home/${NEW_USER}/.ssh/authorized_keys" ]; then
                 install -d -m 700 -o "$NEW_USER" -g "$NEW_USER" "/home/${NEW_USER}/.ssh"
-                install -m 600 -o "$NEW_USER" -g "$NEW_USER" /root/.ssh/authorized_keys "/home/${NEW_USER}/.ssh/authorized_keys"
+                install -m 600 -o "$NEW_USER" -g "$NEW_USER" \
+                    /root/.ssh/authorized_keys "/home/${NEW_USER}/.ssh/authorized_keys"
             fi
         else
             warn "Вход по паролю оставлен включенным. Настройте ключи вручную позже."
@@ -341,9 +348,10 @@ fi
 log "Конфигурация SSH прошла проверку (sshd -t)"
 
 # ============================================================
-#  5. UFW Firewall (с показом правил до включения)
+#  5. UFW Firewall (С ЗАЩИТОЙ ТЕКУЩЕЙ СЕССИИ)
 # ============================================================
 log "[5/9] Настройка UFW..."
+
 sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw || echo 'IPV6=yes' >> /etc/default/ufw
 
 ufw --force reset >/dev/null
@@ -351,6 +359,26 @@ ufw default deny incoming
 ufw default allow outgoing
 ufw default deny routed
 
+# --- ВАЖНО: Определяем порт ТЕКУЩЕЙ SSH-сессии ---
+CURRENT_SSH_PORT=""
+if [ -n "${SSH_CONNECTION:-}" ]; then
+    CURRENT_SSH_PORT=$(echo "$SSH_CONNECTION" | awk '{print $4}')
+fi
+
+if [ -z "$CURRENT_SSH_PORT" ]; then
+    CURRENT_SSH_PORT=$(ss -tnp state established '( dport = :22 or sport = :22 )' 2>/dev/null \
+        | awk 'NR==1 {for(i=1;i<=NF;i++) if($i ~ /:/) {split($i,a,":"); print a[length(a)]; exit}}')
+fi
+
+CURRENT_SSH_PORT="${CURRENT_SSH_PORT:-22}"
+
+# --- Открываем порт текущей сессии (чтобы не потерять доступ) ---
+if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
+    ufw limit "${CURRENT_SSH_PORT}"/tcp comment 'SSH OLD (temporary)'
+    warn "Открыт старый SSH-порт ${CURRENT_SSH_PORT} для сохранения текущей сессии."
+fi
+
+# --- Открываем новый (или текущий) SSH-порт ---
 if [ -n "$NEW_SSH_PORT" ]; then
     ufw limit "${NEW_SSH_PORT}"/tcp comment 'SSH (limited)'
 else
@@ -361,7 +389,7 @@ ufw allow 80/tcp  comment 'HTTP'
 ufw allow 443/tcp comment 'HTTPS'
 ufw allow 443/udp comment 'QUIC/Hysteria2'
 
-# Показываем правила ДО включения
+# Показываем правила ДО включения и запрашиваем подтверждение
 echo ""
 echo -e "${YELLOW}============================================================${NC}"
 echo -e "${YELLOW}📋 ПРАВИЛА FIREWALL (UFW), КОТОРЫЕ БУДУТ ПРИМЕНЕНЫ:${NC}"
@@ -370,13 +398,12 @@ ufw status verbose
 echo -e "${YELLOW}============================================================${NC}"
 echo ""
 
-if ! confirm "Применить эти правила файерволла? (ВНИМАНИЕ: после включения доступ будет ограничен только этими правилами)"; then
-    warn "Применение правил UFW отменено пользователем."
-    warn "Файервол остаётся выключенным. Включите позже: ufw enable"
-else
+if confirm "Применить эти правила файерволла?"; then
     ufw --force enable
     log "UFW успешно включён."
-    ufw status verbose
+else
+    warn "Применение правил UFW отменено пользователем."
+    warn "Файервол остаётся выключенным. Включите позже: ufw enable"
 fi
 
 # ============================================================
@@ -437,7 +464,7 @@ net.ipv4.conf.all.log_martians = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 
-# --- Защита ядра и файловой системы ---
+# --- Защита от распространённых атак и оптимизация ---
 kernel.dmesg_restrict = 1
 kernel.kptr_restrict = 2
 kernel.yama.ptrace_scope = 1
@@ -489,13 +516,13 @@ rkhunter --propupd >/dev/null 2>&1 || true
 log "База rkhunter обновлена."
 
 # ============================================================
-#  ИТОГОВАЯ СВОДКА (ПЕРЕД ПЕРЕЗАПУСКОМ SSH)
+#  ИТОГОВАЯ СВОДКА (ПЕРЕД ПЕРЕЗАПУСКОМ SSH!)
 # ============================================================
 PUBLIC_IP="$(get_public_ip)"
 FINAL_PORT="${NEW_SSH_PORT:-22}"
 FINAL_USER="${NEW_USER:-root}"
 
-# Ждём завершения фонового tee, чтобы лог записался полностью
+# Ожидаем завершения фоновых процессов tee
 wait
 
 echo ""
@@ -505,13 +532,13 @@ echo -e "${GREEN}============================================================${N
 echo ""
 echo -e "${YELLOW}📋 ИТОГОВАЯ КОНФИГУРАЦИЯ:${NC}"
 echo -e "  • IP-адрес сервера:             ${GREEN}${PUBLIC_IP}${NC}"
-echo -e "  • SSH-порт:                     ${RED}${FINAL_PORT}${NC}"
+echo -e "  • SSH-порт (новый):             ${RED}${FINAL_PORT}${NC}"
 echo -e "  • Пользователь для входа:       ${GREEN}${FINAL_USER}${NC}"
-echo -e "  • Root login по SSH:            ${RED}ограничен ключами или отключён${NC}"
+echo -e "  • Root login по SSH:            ${RED}ограничен ключами или отключен${NC}"
 echo -e "  • Password authentication:      ${RED}${DISABLE_PASSWORD}${NC}"
 echo -e "  • Лог скрипта:                  ${LOG_FILE}"
 if [ -f "/root/GENERATED_PRIVATE_KEY.txt" ]; then
-    echo -e "  • Приватный ключ сохранён в:    ${RED}/root/GENERATED_PRIVATE_KEY.txt${NC}"
+    echo -e "  • ПРИВАТНЫЙ КЛЮЧ СОХРАНЕН В:    ${RED}/root/GENERATED_PRIVATE_KEY.txt${NC}"
 fi
 if [ -n "$NEW_SSH_PORT" ]; then
     echo -e "  • Порт сохранён в:              /root/.new_ssh_port"
@@ -525,25 +552,69 @@ else
 fi
 echo ""
 echo -e "${RED}============================================================${NC}"
-echo -e "${RED}⚠️  ВНИМАНИЕ! СЕЙЧАС ПРОИЗОЙДЁТ ПЕРЕЗАПУСК SSH${NC}"
+echo -e "${RED}⚠️  ВНИМАНИЕ! СЕЙЧАС ПРОИЗОЙДЁТ ПЕРЕЗАПУСК SSH              ${NC}"
 echo -e "${RED}============================================================${NC}"
-echo -e "${RED}• Ваша ТЕКУЩАЯ SSH-сессия будет РАЗОРВАНА!${NC}"
-echo -e "${RED}• СКОПИРУЙТЕ команду для подключения ВЫШЕ!${NC}"
-echo -e "${RED}• Откройте НОВОЕ окно терминала и проверьте вход.${NC}"
-echo -e "${RED}• Если потеряли доступ — используйте VNC-консоль хостинга.${NC}"
+echo -e "${RED}• СКОПИРУЙТЕ команду для подключения ВЫШЕ!                  ${NC}"
+echo -e "${RED}• Откройте НОВОЕ окно терминала и проверьте вход.           ${NC}"
+echo -e "${RED}• Только ПОСЛЕ успешной проверки закрывайте эту сессию.     ${NC}"
+echo -e "${RED}• Если потеряли доступ — используйте VNC-консоль хостинга.  ${NC}"
 echo -e "${RED}============================================================${NC}"
 echo ""
 
-if ! confirm "Вы готовы к перезапуску SSH? Текущая сессия будет разорвана"; then
+if ! confirm "Вы готовы к перезапуску SSH?"; then
     warn "Перезапуск SSH отменён пользователем."
     warn "Чтобы применить настройки позже, выполните: systemctl reload ssh"
     exit 0
 fi
 
-# Перезапуск SSH — ПОСЛЕДНИМ шагом, с проверкой и reload
+# Перезапуск SSH — ПОСЛЕДНИМ шагом
 service_restart_or_reload_ssh
 
 echo ""
-echo -e "${GREEN}✅ SSH успешно перезапущен. Текущая сессия может быть разорвана.${NC}"
-echo -e "${GREEN}   Используйте команду выше для повторного подключения.${NC}"
+echo -e "${GREEN}✅ SSH успешно перезапущен.${NC}"
+echo ""
+
+# ============================================================
+#  АВТОМАТИЧЕСКОЕ ЗАКРЫТИЕ СТАРОГО ПОРТА
+# ============================================================
+if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
+    echo -e "${YELLOW}============================================================${NC}"
+    echo -e "${YELLOW}🔐 АВТОМАТИЧЕСКОЕ ЗАКРЫТИЕ СТАРОГО ПОРТА                   ${NC}"
+    echo -e "${YELLOW}============================================================${NC}"
+    echo ""
+    echo -e "${YELLOW}Старый порт ${CURRENT_SSH_PORT} временно открыт для сохранения текущей сессии.${NC}"
+    echo -e "${YELLOW}После подтверждения он будет автоматически закрыт.${NC}"
+    echo ""
+    
+    if confirm "Вы успешно проверили подключение через новый порт ${FINAL_PORT}?"; then
+        log "Закрываем старый SSH-порт ${CURRENT_SSH_PORT}..."
+        ufw delete limit "${CURRENT_SSH_PORT}"/tcp >/dev/null 2>&1
+        log "Старый порт ${CURRENT_SSH_PORT} успешно закрыт."
+        echo ""
+        echo -e "${GREEN}✅ Теперь доступен только новый порт: ${FINAL_PORT}${NC}"
+    else
+        warn "Закрытие старого порта отменено."
+        warn "Вы можете закрыть его позже командой: ufw delete limit ${CURRENT_SSH_PORT}/tcp"
+    fi
+fi
+
+echo ""
+echo -e "${GREEN}============================================================${NC}"
+echo -e "${GREEN}           НАСТРОЙКА ПОЛНОСТЬЮ ЗАВЕРШЕНА!                   ${NC}"
+echo -e "${GREEN}============================================================${NC}"
+echo ""
+echo -e "${GREEN}✅ Сервер настроен и защищён.${NC}"
+echo -e "${GREEN}   Используйте команду для подключения:${NC}"
+if [ -n "$NEW_USER" ]; then
+    echo -e "   ${GREEN}ssh -p ${FINAL_PORT} ${NEW_USER}@${PUBLIC_IP}${NC}"
+else
+    echo -e "   ${GREEN}ssh -p ${FINAL_PORT} root@${PUBLIC_IP}${NC}"
+fi
+echo ""
+if [ -f "/root/GENERATED_PRIVATE_KEY.txt" ]; then
+    echo -e "${YELLOW}⚠️  Не забудьте удалить файл с приватным ключом:${NC}"
+    echo -e "   ${RED}sudo rm -f /root/GENERATED_PRIVATE_KEY.txt${NC}"
+    echo ""
+fi
+echo -e "${GREEN}Спасибо за использование скрипта!${NC}"
 echo ""
