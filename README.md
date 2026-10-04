@@ -11,14 +11,16 @@
 
 ### Вариант 1: Скачивание и ручной запуск (рекомендуется)
 
-```bash
 # Скачать скрипт
+```bash
 curl -fsSL -o setup.sh https://raw.githubusercontent.com/thealekseev/vps-setup/refs/heads/main/setup.sh
-
+```
 # Сделать исполняемым
+```bash
 chmod +x setup.sh
-
+```
 # Запустить
+```bash
 ./setup.sh
 ```
 
