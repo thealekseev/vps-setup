@@ -67,14 +67,11 @@ step_start() {
 }
 
 # Heartbeat: фоновый индикатор жизни.
-#   * В терминале: вращающийся спиннер + счётчик секунд.
-#   * Без TTY:     периодическая запись в лог каждые 60 с.
 _heartbeat() {
     local desc="$1"
     local start="$2"
     local tick=0
     local now elapsed
-    # Кадры спиннера — символы Брайля.
     local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
     local n=${#frames[@]}
 
@@ -138,8 +135,6 @@ step_done() {
 # ---------- Вспомогательные функции ----------
 confirm() {
     local prompt="$1" answer
-    # Чтение строго из /dev/tty гарантирует работу интерактивных запросов
-    # даже при запуске скрипта через конвейер (curl ... | sudo bash).
     read -r -p "$(echo -e "${YELLOW}${prompt} [y/N]: ${NC}")" answer < /dev/tty
     [[ "$answer" =~ ^[Yy]$ ]]
 }
@@ -147,8 +142,7 @@ confirm() {
 # pad_right «строка» «ширина»
 # Возвращает строку, добитую пробелами справа до нужной ШИРИНЫ В СИМВОЛАХ.
 # Стандартный printf "%-Ns" считает БАЙТЫ, поэтому кириллица в UTF-8
-# (2 байта на символ) ломает выравнивание. Здесь используем ${#var} —
-# в UTF-8 локали это именно количество символов.
+# (2 байта на символ) ломает выравнивание. ${#var} в UTF-8 локали — символы.
 pad_right() {
     local s="$1" width="$2"
     local padding=$(( width - ${#s} ))
@@ -176,9 +170,6 @@ validate_username() {
     return 0
 }
 
-# Читает эффективное значение параметра из sshd_config.
-# `sshd -T` учитывает Include и drop-in файлы. Может вернуть non-zero
-# при warnings в конфиге — для нас это чисто информационный вызов.
 sshd_current() {
     local key="$1"
     local val=""
@@ -243,31 +234,21 @@ done
 #  1. Предварительный анализ системы
 # ============================================================
 # Здесь мы ТОЛЬКО читаем текущее состояние и показываем его пользователю.
-# Ничего не меняется. Это нужно, чтобы пользователь заранее увидел,
-# из чего мы исходим, и что именно будет изменено в следующих шагах.
-#
-# ВАЖНО: все команды ниже — информационные. Любая из них может вернуть
-# non-zero (например, systemctl is-active для inactive-сервиса), и с
-# включённым `trap ERR` это вызвало бы ложное срабатывание. Поэтому
-# каждое присваивание защищено `|| true`, а значение по умолчанию
-# подставляется отдельно через ${VAR:-default}.
+# Ничего не меняется. Все команды — информационные, поэтому защищены
+# `|| true` (любая из них может вернуть non-zero, и trap ERR сработал бы
+# ложно).
 step_start "Предварительный анализ системы"
 
-# --- Текущая конфигурация SSH (эффективная, с учётом include/drop-in) ---
 CUR_SSH_PORT="$(sshd_current port || true)";  CUR_SSH_PORT="${CUR_SSH_PORT:-22}"
 CUR_PERMIT_ROOT_LOGIN="$(sshd_current permitrootlogin || true)"
 CUR_PASSWORD_AUTH="$(sshd_current passwordauthentication || true)"
 CUR_PUBKEY_AUTH="$(sshd_current pubkeyauthentication || true)"
-# awk с `exit` вместо `| head -1` — чтобы не ловить SIGPIPE+pipefail.
 CUR_ALLOW_USERS="$(sshd -T 2>/dev/null | awk '$1=="allowusers" {print $0; exit}' || true)"
 
-# --- Наличие SSH-ключей ---
 CUR_KEYS_ROOT="нет"
 [ -s /root/.ssh/authorized_keys ] && CUR_KEYS_ROOT="есть"
 
-# Массив пользователей с ключами (без подshell'а — используем массив).
 declare -a CUR_KEYED_USERS=()
-# nullglob: если ничего не найдено, паттерн не подставляется буквально.
 shopt -s nullglob
 for d in /home/*/.ssh/authorized_keys; do
     [ -s "$d" ] || continue
@@ -276,7 +257,6 @@ for d in /home/*/.ssh/authorized_keys; do
 done
 shopt -u nullglob
 
-# --- Socket-активация SSH ---
 CUR_SSH_SOCKET="нет"
 if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
     CUR_SSH_SOCKET="да (Ubuntu 22.10+/Debian 12+)"
@@ -285,26 +265,17 @@ else
     SSH_USES_SOCKET=0
 fi
 
-# --- UFW ---
-# awk NR==1 без head — избегаем SIGPIPE+pipefail.
 CUR_UFW_STATUS="$(ufw status 2>/dev/null | awk 'NR==1 {print $2}' || true)"
 CUR_UFW_STATUS="${CUR_UFW_STATUS:-не установлен}"
 
-# --- Fail2ban ---
-# `systemctl is-active` ВСЕГДА возвращает non-zero для inactive/failed.
-# Это не ошибка — просто состояние сервиса.
 CUR_F2B_STATUS="$(systemctl is-active fail2ban 2>/dev/null || true)"
 CUR_F2B_STATUS="${CUR_F2B_STATUS:-inactive}"
 
-# --- Swap / TZ ---
 CUR_SWAP="нет"
 swapon --show 2>/dev/null | grep -q . && CUR_SWAP="есть"
 CUR_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
 CUR_TZ="${CUR_TZ:-unknown}"
 
-# --- Печатаем сводку ---
-# Используем pad_right с шириной 26 символов — это правильно считает
-# кириллицу (в отличие от printf "%-26s", который считает байты).
 LABEL_WIDTH=26
 
 echo ""
@@ -365,7 +336,6 @@ if ! run_timed "apt-get install" apt-get install -y \
     confirm "Продолжить?" || exit 1
 fi
 
-# Жёсткая проверка наличия критически важных бинарных файлов.
 command -v ufw            >/dev/null || { err "ufw не установлен, дальше нельзя"; exit 1; }
 command -v fail2ban-server >/dev/null || { err "fail2ban-server не установлен, дальше нельзя"; exit 1; }
 step_done
@@ -385,7 +355,99 @@ else
     info "Swap уже настроен."
 fi
 
-timedatectl set-timezone "${TZ:-UTC}" 2>/dev/null || warn "timedatectl недоступен"
+# --- Часовой пояс ---
+# Показываем текущий TZ, предлагаем сменить. Список популярных зон +
+# возможность ввести вручную. Валидируем через timedatectl list-timezones.
+if command -v timedatectl >/dev/null 2>&1; then
+    CUR_TZ_NOW="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+    CUR_TZ_NOW="${CUR_TZ_NOW:-UTC}"
+    info "Текущий часовой пояс: ${CUR_TZ_NOW}"
+
+    if confirm "Сменить часовой пояс?"; then
+        # Формируем список: текущий TZ первым, TZ из env (если есть),
+        # затем популярные зоны. Дубликаты не добавляем.
+        declare -a TZ_CHOICES=()
+        TZ_CHOICES+=("${CUR_TZ_NOW}")
+        if [ -n "${TZ:-}" ] && [ "$TZ" != "$CUR_TZ_NOW" ]; then
+            TZ_CHOICES+=("${TZ}")
+        fi
+        for tz in \
+            "UTC" \
+            "Europe/Moscow" \
+            "Europe/Kyiv" \
+            "Europe/Minsk" \
+            "Europe/Berlin" \
+            "Europe/London" \
+            "Europe/Paris" \
+            "Europe/Lisbon" \
+            "Asia/Almaty" \
+            "Asia/Tashkent" \
+            "Asia/Tbilisi" \
+            "Asia/Yerevan" \
+            "Asia/Dubai" \
+            "Asia/Tokyo" \
+            "Asia/Shanghai" \
+            "Asia/Singapore" \
+            "America/New_York" \
+            "America/Los_Angeles" \
+        ; do
+            local_dup=0
+            for x in "${TZ_CHOICES[@]}"; do
+                [ "$x" = "$tz" ] && { local_dup=1; break; }
+            done
+            [ "$local_dup" -eq 0 ] && TZ_CHOICES+=("$tz")
+        done
+
+        echo ""
+        echo -e "${YELLOW}Доступные варианты:${NC}"
+        idx=1
+        for tz in "${TZ_CHOICES[@]}"; do
+            marker=""
+            [ "$tz" = "$CUR_TZ_NOW" ] && marker=" ${GREEN}(текущий)${NC}"
+            [ "$tz" = "${TZ:-}" ] && [ "$tz" != "$CUR_TZ_NOW" ] && marker=" ${CYAN}(из окружения TZ)${NC}"
+            echo -e "  $(printf '%2d' "$idx")) ${tz}${marker}"
+            idx=$((idx + 1))
+        done
+        echo ""
+        echo -e "  ${CYAN}Введите номер из списка, либо свою зону вручную (например, Europe/Lisbon).${NC}"
+        echo -e "  ${CYAN}Пустой ввод — оставить ${CUR_TZ_NOW}.${NC}"
+        echo ""
+
+        read -r -p "$(echo -e "${YELLOW}Часовой пояс: ${NC}")" TZ_INPUT < /dev/tty
+
+        SELECTED_TZ=""
+        if [ -z "$TZ_INPUT" ]; then
+            info "Часовой пояс оставлен без изменений: ${CUR_TZ_NOW}"
+            SELECTED_TZ="$CUR_TZ_NOW"
+        elif [[ "$TZ_INPUT" =~ ^[0-9]+$ ]] \
+             && [ "$TZ_INPUT" -ge 1 ] \
+             && [ "$TZ_INPUT" -le "${#TZ_CHOICES[@]}" ]; then
+            SELECTED_TZ="${TZ_CHOICES[$((TZ_INPUT - 1))]}"
+        else
+            SELECTED_TZ="$TZ_INPUT"
+        fi
+
+        if [ "$SELECTED_TZ" != "$CUR_TZ_NOW" ]; then
+            if timedatectl list-timezones 2>/dev/null | grep -Fxq "$SELECTED_TZ"; then
+                if timedatectl set-timezone "$SELECTED_TZ" 2>/dev/null; then
+                    log "Часовой пояс установлен: ${SELECTED_TZ}"
+                else
+                    warn "Не удалось установить ${SELECTED_TZ}. Оставляем ${CUR_TZ_NOW}."
+                fi
+            else
+                warn "Часовой пояс '${SELECTED_TZ}' не найден в базе системы."
+                warn "Оставляем ${CUR_TZ_NOW}. Полный список: timedatectl list-timezones"
+            fi
+        else
+            info "Часовой пояс не изменён: ${CUR_TZ_NOW}"
+        fi
+    else
+        info "Часовой пояс оставлен: ${CUR_TZ_NOW}"
+    fi
+else
+    warn "timedatectl недоступен — пропускаем настройку часового пояса"
+fi
+
 systemctl enable --now chrony 2>/dev/null \
   || systemctl enable --now systemd-timesyncd 2>/dev/null || true
 step_done
@@ -393,9 +455,6 @@ step_done
 # ============================================================
 #  5. SSH hardening — планирование и применение
 # ============================================================
-# Здесь мы сначала собираем все решения, ничего не меняя.
-# Затем показываем итоговый план «текущее → планируемое» и запрашиваем
-# явное подтверждение. Только после этого пишем конфиг и применяем.
 step_start "SSH hardening"
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
@@ -423,12 +482,9 @@ if confirm "Создать non-root пользователя с правами s
         log "Пользователь $NEW_USER создан."
     fi
 
-    # Добавляем в группу sudo безусловно, даже если пользователь уже существовал
     usermod -aG sudo "$NEW_USER"
     log "Пользователь $NEW_USER добавлен в группу sudo."
 
-    # Создаём drop-in файл для sudo без пароля, так как adduser --disabled-password
-    # устанавливает заблокированный пароль ("!"), что ломает работу sudo.
     if [ "$USER_JUST_CREATED" -eq 1 ]; then
         SUDOERS_FILE="/etc/sudoers.d/90-${NEW_USER}"
         if [ ! -f "$SUDOERS_FILE" ]; then
@@ -440,7 +496,6 @@ if confirm "Создать non-root пользователя с правами s
         fi
     fi
 
-    # Копируем ключи root новому пользователю для удобства первоначального входа
     if [ -s /root/.ssh/authorized_keys ] && [ ! -s "/home/${NEW_USER}/.ssh/authorized_keys" ]; then
         install -d -m 700 -o "$NEW_USER" -g "$NEW_USER" "/home/${NEW_USER}/.ssh"
         install -m 600 -o "$NEW_USER" -g "$NEW_USER" \
@@ -458,10 +513,9 @@ done
 
 DISABLE_PASSWORD="no"
 if [ "$HAS_KEYS" -eq 1 ]; then
-    # Ключи найдены → согласно политике скрипта отключаем вход по паролю.
-    # Не спрашиваем подтверждения: наличие рабочих ключей — достаточный
-    # сигнал. Пользователь ещё увидит это изменение в ПЛАНЕ ИЗМЕНЕНИЙ SSH
-    # ниже и сможет отклонить весь план целиком, если не согласен.
+    # Ключи найдены → согласно политике отключаем вход по паролю.
+    # Пользователь увидит это в ПЛАНЕ ИЗМЕНЕНИЙ SSH ниже и может
+    # отклонить весь план целиком, ответив "n".
     DISABLE_PASSWORD="yes"
     info "Найдены SSH-ключи → PasswordAuthentication будет отключён."
     warn "Проверьте ДО применения, что вход по ключу работает:"
@@ -471,8 +525,6 @@ else
     if confirm "Сгенерировать новый ed25519-ключ?"; then
         mkdir -p /root/.ssh; chmod 700 /root/.ssh
 
-        # Генерируем ключ только если его нет, и перенаправляем ввод из /dev/null,
-        # чтобы избежать зависания при отсутствии TTY.
         if [ ! -f /root/.ssh/id_ed25519 ]; then
             ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N "" \
                 -C "root@$(hostname)" </dev/null >/dev/null 2>&1
@@ -506,9 +558,6 @@ else
 fi
 
 # --- 5.3. Смена порта SSH (планирование) ---
-# Порт только генерируется и сохраняется в файл. Никаких действий с
-# ssh.socket или sshd пока не производится — всё это будет в фазе применения
-# ниже, после подтверждения плана.
 NEW_SSH_PORT=""
 if confirm "Сменить стандартный SSH-порт (22)?"; then
     for _ in $(seq 1 20); do
@@ -520,22 +569,17 @@ if confirm "Сменить стандартный SSH-порт (22)?"; then
 fi
 
 # --- 5.4. Определение финальных значений ---
-# Собираем массив пользователей, у которых реально есть настроенные ключи
 declare -a KEYED_USERS=()
 [ -s /root/.ssh/authorized_keys ] && KEYED_USERS+=("root")
 [ -n "$NEW_USER" ] && [ -s "/home/${NEW_USER}/.ssh/authorized_keys" ] \
     && KEYED_USERS+=("$NEW_USER")
 
-# КРИТИЧЕСКАЯ ЗАЩИТА: Если ни у кого нет ключей, отключать пароль нельзя!
 if [ ${#KEYED_USERS[@]} -eq 0 ] && [ "$DISABLE_PASSWORD" = "yes" ]; then
     warn "КРИТИЧЕСКОЕ ПРЕДУПРЕЖДЕНИЕ: Ни у одного пользователя нет ключей."
     warn "Вход по паролю принудительно оставлен включенным во избежание блокировки."
     DISABLE_PASSWORD="no"
 fi
 
-# Запрет прямого входа root разрешен только если у нового пользователя есть ключи.
-# Это ключевой пункт политики: полное отключение root-логина делается только
-# когда у не-root пользователя есть рабочий ключ для аварийного входа.
 if [ -n "$NEW_USER" ] && [ -s "/home/${NEW_USER}/.ssh/authorized_keys" ]; then
     ROOT_LOGIN_VAL="no"
     ROOT_LOGIN_REASON="у ${NEW_USER} есть ключ для аварийного входа"
@@ -562,28 +606,24 @@ FINAL_PORT_PREVIEW="${NEW_SSH_PORT:-${CUR_SSH_PORT}}"
 echo "  $(pad_right 'Параметр' 24)Было → Станет"
 echo "  ────────────────────────────────────────────────────────"
 
-# Порт
 if [ "$CUR_SSH_PORT" = "$FINAL_PORT_PREVIEW" ]; then
     echo "  $(pad_right 'SSH-порт' 24)${CUR_SSH_PORT} (без изменений)"
 else
     echo "  $(pad_right 'SSH-порт' 24)${CUR_SSH_PORT} → ${FINAL_PORT_PREVIEW}"
 fi
 
-# PermitRootLogin
 if [ "$CUR_PERMIT_ROOT_LOGIN" = "$ROOT_LOGIN_VAL" ]; then
     echo "  $(pad_right 'PermitRootLogin' 24)${ROOT_LOGIN_VAL} (без изменений)"
 else
     echo "  $(pad_right 'PermitRootLogin' 24)${CUR_PERMIT_ROOT_LOGIN:-?} → ${ROOT_LOGIN_VAL}"
 fi
 
-# PasswordAuthentication — ключевой пункт
 if [ "$CUR_PASSWORD_AUTH" = "$DISABLE_PASSWORD" ]; then
     echo "  $(pad_right 'PasswordAuthentication' 24)${DISABLE_PASSWORD} (без изменений)"
 else
     echo "  $(pad_right 'PasswordAuthentication' 24)${CUR_PASSWORD_AUTH:-?} → ${DISABLE_PASSWORD}"
 fi
 
-# AllowUsers
 if [ -n "$NEW_USER" ]; then
     CUR_ALLOW="${CUR_ALLOW_USERS:-<все>}"
     echo "  $(pad_right 'AllowUsers' 24)${CUR_ALLOW} → ${NEW_USER}"
@@ -592,7 +632,6 @@ fi
 echo "  ────────────────────────────────────────────────────────"
 echo ""
 
-# Пояснения по ключевым пунктам
 echo -e "  ${YELLOW}Пояснения:${NC}"
 echo -e "    • ${CYAN}PermitRootLogin = ${ROOT_LOGIN_VAL}${NC}"
 echo -e "      ${ROOT_LOGIN_REASON}"
@@ -618,7 +657,6 @@ if ! confirm "Применить эти изменения SSH?"; then
 fi
 
 # --- 5.7. Применение конфигурации SSH ---
-# Отключаем ssh.socket (если он был), чтобы Port из sshd_config применялся
 if [ -n "$NEW_SSH_PORT" ] && [ "$SSH_USES_SOCKET" -eq 1 ]; then
     log "Отключаем ssh.socket (иначе Port в sshd_config игнорируется)..."
     systemctl disable --now ssh.socket 2>/dev/null || warn "disable ssh.socket не удался"
@@ -626,13 +664,11 @@ if [ -n "$NEW_SSH_PORT" ] && [ "$SSH_USES_SOCKET" -eq 1 ]; then
     systemctl start ssh.service 2>/dev/null || true
 fi
 
-# Сохраняем новый порт для последующих шагов
 if [ -n "$NEW_SSH_PORT" ]; then
     echo "$NEW_SSH_PORT" > /root/.new_ssh_port
     chmod 600 /root/.new_ssh_port
 fi
 
-# Формируем конфиг drop-in
 cat > "$HARDENING_CONF" <<EOF
 # Сгенерировано hardening-скриптом $(date -Iseconds)
 
@@ -666,9 +702,6 @@ if ! grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d/\*' "$SSHD_CONFIG"; then
     echo "Include /etc/ssh/sshd_config.d/*.conf" >> "$SSHD_CONFIG"
 fi
 
-# Права доступа:
-# sshd_config — 644 (стандарт дистрибутива, ожидается инструментами аудита)
-# 99-hardening.conf — 600 (drop-in с эффективной политикой, CIS §5.2.1)
 chown root:root "$SSHD_CONFIG" "$HARDENING_CONF"
 chmod 644 "$SSHD_CONFIG"
 chmod 600 "$HARDENING_CONF"
@@ -688,7 +721,6 @@ step_start "Подготовка правил UFW"
 
 sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw || echo 'IPV6=yes' >> /etc/default/ufw
 
-# Предупреждаем, если UFW уже активен: --force reset уничтожит существующие правила.
 if ufw status 2>/dev/null | grep -q "Status: active"; then
     warn "UFW уже активен — команда reset удалит все текущие правила."
     if ! confirm "Сбросить существующие правила UFW и начать заново?"; then
@@ -707,10 +739,6 @@ if [ -n "${SSH_CONNECTION:-}" ]; then
     CURRENT_SSH_PORT=$(echo "$SSH_CONNECTION" | awk '{print $4}')
 fi
 
-# Совместимый fallback: разбираем established-соединения через ss.
-# grep возвращает 1, если нет established-соединений, а head может
-# закрыть pipe раньше времени → с pipefail весь конвейер вернёт
-# non-zero. `|| true` защищает от ложного срабатывания ERR trap.
 if [ -z "$CURRENT_SSH_PORT" ]; then
     CURRENT_SSH_PORT=$(ss -tn state established 2>/dev/null \
         | awk '{print $4}' \
@@ -721,13 +749,11 @@ fi
 CURRENT_SSH_PORT="${CURRENT_SSH_PORT:-22}"
 log "Текущий SSH-порт сессии: ${CURRENT_SSH_PORT}"
 
-# Сохраняем текущую сессию, открывая старый порт, если он отличается от нового
 if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
     ufw limit "${CURRENT_SSH_PORT}"/tcp comment 'SSH OLD (temp)'
     warn "Временно открыт старый порт ${CURRENT_SSH_PORT}."
 fi
 
-# Открываем реальный порт сессии, чтобы избежать lockout на нестандартных портах
 if [ -n "$NEW_SSH_PORT" ]; then
     ufw limit "${NEW_SSH_PORT}"/tcp comment 'SSH (limited)'
 else
@@ -746,7 +772,6 @@ step_done
 step_start "Fail2Ban"
 backup_file /etc/fail2ban/jail.local
 
-# Если порт не менялся, jail должен слушать реальный порт сессии, а не 22
 F2B_PORT="${NEW_SSH_PORT:-${CURRENT_SSH_PORT:-22}}"
 
 cat > /etc/fail2ban/jail.local <<EOF
@@ -859,6 +884,7 @@ step_done
 PUBLIC_IP="$(get_public_ip)"
 FINAL_PORT="${NEW_SSH_PORT:-${CURRENT_SSH_PORT:-22}}"
 FINAL_USER="${NEW_USER:-root}"
+FINAL_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || echo unknown)"
 
 echo ""
 echo -e "${GREEN}============================================================${NC}"
@@ -871,6 +897,7 @@ echo "  • SSH-порт:                ${RED}${FINAL_PORT}${NC}"
 echo "  • Пользователь:            ${GREEN}${FINAL_USER}${NC}"
 echo "  • Root login:              ${RED}${ROOT_LOGIN_VAL}${NC}"
 echo "  • Password auth:           ${RED}${DISABLE_PASSWORD}${NC}"
+echo "  • Часовой пояс:            ${GREEN}${FINAL_TZ}${NC}"
 echo "  • Лог:                     ${LOG_FILE}"
 
 [ -f /root/GENERATED_PRIVATE_KEY.txt ] && \
