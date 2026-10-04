@@ -33,7 +33,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/thealekseev/vps-setup/refs/h
 ```bash
 sudo ./setup.sh --check
 ```
-Или короткий вариант:
+#### Или короткий вариант:
 ```bash
 sudo ./setup.sh -c
 ```
