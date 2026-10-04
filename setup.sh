@@ -5,11 +5,19 @@
 #  Поддержка: Ubuntu 20.04/22.04/24.04, Debian 11/12
 #  Запуск от имени root
 #
-#  Изменения в v2.2:
+#  Репозиторий: https://github.com/thealekseev/vps-setup
+#
+#  Особенности:
+#   - Ожидание разблокировки apt (для свежих VPS с cloud-init)
+#   - Создание Swap-файла 2GB для предотвращения OOM
+#   - Интерактивная генерация SSH-ключей (без утечки в лог)
 #   - Валидация имени нового пользователя
-#   - Итоговая конфигурация выводится ПЕРЕД перезапуском SSH
+#   - Показ правил UFW до включения файерволла
+#   - Итоговая конфигурация ПЕРЕД перезапуском SSH
 #   - Явное предупреждение о разрыве текущей сессии
-#   - Готовая команда для повторного подключения в выводе
+#   - Безопасный перезапуск SSH (проверка конфига + reload)
+#   - Идемпотентность (можно запускать повторно)
+#   - Расширенный sysctl-hardening и unattended-upgrades
 # ============================================================
 
 set -uo pipefail
@@ -47,17 +55,13 @@ backup_file() {
     fi
 }
 
-# Валидация имени пользователя Linux
 validate_username() {
     local name="$1"
-    # Имя должно начинаться с буквы или _, содержать только буквы, цифры, _ и -
-    # Длина от 1 до 32 символов
     if [[ ! "$name" =~ ^[a-z_][a-z0-9_-]*$ ]] || [ "${#name}" -gt 32 ] || [ -z "$name" ]; then
         return 1
     fi
-    # Проверка зарезервированных имён
     case "$name" in
-        root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|gnats|nobody|systemd-*|sshd|ubuntu|debian)
+        root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|gnats|nobody|sshd|ubuntu|debian)
             return 1
             ;;
     esac
@@ -176,27 +180,27 @@ mkdir -p "$SSHD_DIR"
 HARDENING_CONF="${SSHD_DIR}/99-hardening.conf"
 backup_file "$SSHD_CONFIG"
 
-# --- 4.1. Non-root пользователь с sudo (С ВАЛИДАЦИЕЙ) ---
+# --- 4.1. Non-root пользователь с sudo (с валидацией) ---
 NEW_USER=""
 if confirm "Создать non-root пользователя с правами sudo?"; then
     while true; do
         read -r -p "$(echo -e "${YELLOW}Введите имя нового пользователя (латиница, цифры, _ и -): ${NC}")" NEW_USER
-        
+
         if [ -z "$NEW_USER" ]; then
             warn "Имя не может быть пустым. Попробуйте снова."
             continue
         fi
-        
+
         if ! validate_username "$NEW_USER"; then
-            warn "Недопустимое имя пользователя. Используйте только латинские буквы, цифры, _ и -. Имя должно начинаться с буквы или _."
+            warn "Недопустимое имя. Используйте только латинские буквы, цифры, _ и -. Имя должно начинаться с буквы или _."
             continue
         fi
-        
+
         if id "$NEW_USER" &>/dev/null; then
             info "Пользователь $NEW_USER уже существует"
             break
         fi
-        
+
         adduser --disabled-password --gecos "" "$NEW_USER"
         usermod -aG sudo "$NEW_USER"
         log "Пользователь $NEW_USER создан и добавлен в группу sudo"
@@ -233,19 +237,20 @@ else
         ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N "" -C "root@$(hostname)" >/dev/null 2>&1
         cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
         chmod 600 /root/.ssh/authorized_keys
-        
+
+        # Приватный ключ сохраняем в защищённый файл, НЕ выводим в лог
         KEY_FILE="/root/GENERATED_PRIVATE_KEY.txt"
         cp /root/.ssh/id_ed25519 "$KEY_FILE"
         chmod 400 "$KEY_FILE"
-        
+
         echo ""
         echo -e "${RED}=========================================================================${NC}"
-        echo -e "${RED}  ВНИМАНИЕ! Приватный ключ сохранен в файл: ${KEY_FILE}  ${NC}"
+        echo -e "${RED}  ВНИМАНИЕ! Приватный ключ сохранён в файл: ${KEY_FILE}  ${NC}"
         echo -e "${RED}  СКОПИРУЙТЕ ЕГО ОТТУДА И УДАЛИТЕ ФАЙЛ ПОСЛЕ НАСТРОЙКИ КЛИЕНТА!          ${NC}"
         echo -e "${RED}  Без этого файла вы НЕ СМОЖЕТЕ войти на сервер после отключения паролей. ${NC}"
         echo -e "${RED}=========================================================================${NC}"
         echo ""
-        
+
         if confirm "Вы скопировали приватный ключ и готовы отключить вход по паролю?"; then
             DISABLE_PASSWORD="yes"
             if [ -n "$NEW_USER" ] && [ ! -s "/home/${NEW_USER}/.ssh/authorized_keys" ]; then
@@ -336,7 +341,7 @@ fi
 log "Конфигурация SSH прошла проверку (sshd -t)"
 
 # ============================================================
-#  5. UFW Firewall
+#  5. UFW Firewall (с показом правил до включения)
 # ============================================================
 log "[5/9] Настройка UFW..."
 sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw || echo 'IPV6=yes' >> /etc/default/ufw
@@ -356,8 +361,23 @@ ufw allow 80/tcp  comment 'HTTP'
 ufw allow 443/tcp comment 'HTTPS'
 ufw allow 443/udp comment 'QUIC/Hysteria2'
 
-ufw --force enable
+# Показываем правила ДО включения
+echo ""
+echo -e "${YELLOW}============================================================${NC}"
+echo -e "${YELLOW}📋 ПРАВИЛА FIREWALL (UFW), КОТОРЫЕ БУДУТ ПРИМЕНЕНЫ:${NC}"
+echo -e "${YELLOW}============================================================${NC}"
 ufw status verbose
+echo -e "${YELLOW}============================================================${NC}"
+echo ""
+
+if ! confirm "Применить эти правила файерволла? (ВНИМАНИЕ: после включения доступ будет ограничен только этими правилами)"; then
+    warn "Применение правил UFW отменено пользователем."
+    warn "Файервол остаётся выключенным. Включите позже: ufw enable"
+else
+    ufw --force enable
+    log "UFW успешно включён."
+    ufw status verbose
+fi
 
 # ============================================================
 #  6. Fail2Ban
@@ -396,6 +416,7 @@ log "[7/9] Настройка ядра (sysctl)..."
 
 SYSCTL_CONF="/etc/sysctl.d/99-hardening.conf"
 cat > "$SYSCTL_CONF" <<'EOF'
+# --- Сетевая защита ---
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.tcp_syncookies = 1
@@ -410,9 +431,13 @@ net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_source_route = 0
 net.ipv6.conf.default.accept_source_route = 0
+
+# --- Логирование подозрительных пакетов ---
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# --- Защита ядра и файловой системы ---
 kernel.dmesg_restrict = 1
 kernel.kptr_restrict = 2
 kernel.yama.ptrace_scope = 1
@@ -470,6 +495,7 @@ PUBLIC_IP="$(get_public_ip)"
 FINAL_PORT="${NEW_SSH_PORT:-22}"
 FINAL_USER="${NEW_USER:-root}"
 
+# Ждём завершения фонового tee, чтобы лог записался полностью
 wait
 
 echo ""
@@ -481,11 +507,11 @@ echo -e "${YELLOW}📋 ИТОГОВАЯ КОНФИГУРАЦИЯ:${NC}"
 echo -e "  • IP-адрес сервера:             ${GREEN}${PUBLIC_IP}${NC}"
 echo -e "  • SSH-порт:                     ${RED}${FINAL_PORT}${NC}"
 echo -e "  • Пользователь для входа:       ${GREEN}${FINAL_USER}${NC}"
-echo -e "  • Root login по SSH:            ${RED}ограничен ключами или отключен${NC}"
+echo -e "  • Root login по SSH:            ${RED}ограничен ключами или отключён${NC}"
 echo -e "  • Password authentication:      ${RED}${DISABLE_PASSWORD}${NC}"
 echo -e "  • Лог скрипта:                  ${LOG_FILE}"
 if [ -f "/root/GENERATED_PRIVATE_KEY.txt" ]; then
-    echo -e "  • ПРИВАТНЫЙ КЛЮЧ СОХРАНЕН В:      ${RED}/root/GENERATED_PRIVATE_KEY.txt${NC}"
+    echo -e "  • Приватный ключ сохранён в:    ${RED}/root/GENERATED_PRIVATE_KEY.txt${NC}"
 fi
 if [ -n "$NEW_SSH_PORT" ]; then
     echo -e "  • Порт сохранён в:              /root/.new_ssh_port"
@@ -499,13 +525,12 @@ else
 fi
 echo ""
 echo -e "${RED}============================================================${NC}"
-echo -e "${RED}⚠️  ВНИМАНИЕ! СЕЙЧАС ПРОИЗОЙДЁТ ПЕРЕЗАПУСК SSH               ${NC}"
+echo -e "${RED}⚠️  ВНИМАНИЕ! СЕЙЧАС ПРОИЗОЙДЁТ ПЕРЕЗАПУСК SSH${NC}"
 echo -e "${RED}============================================================${NC}"
-echo -e "${RED}• Ваша ТЕКУЩАЯ SSH-сессия будет РАЗОРВАНА!                   ${NC}"
-echo -e "${RED}• СКОПИРУЙТЕ команду для подключения ВЫШЕ, прежде чем         ${NC}"
-echo -e "${RED}  продолжать!                                                 ${NC}"
-echo -e "${RED}• Откройте НОВОЕ окно терминала и проверьте вход.             ${NC}"
-echo -e "${RED}• Если потеряли доступ — используйте VNC-консоль хостинга.    ${NC}"
+echo -e "${RED}• Ваша ТЕКУЩАЯ SSH-сессия будет РАЗОРВАНА!${NC}"
+echo -e "${RED}• СКОПИРУЙТЕ команду для подключения ВЫШЕ!${NC}"
+echo -e "${RED}• Откройте НОВОЕ окно терминала и проверьте вход.${NC}"
+echo -e "${RED}• Если потеряли доступ — используйте VNC-консоль хостинга.${NC}"
 echo -e "${RED}============================================================${NC}"
 echo ""
 
