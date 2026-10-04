@@ -1,17 +1,19 @@
 #!/bin/bash
 
 # ============================================================
-#  Скрипт базовой настройки и hardening Linux-сервера (v2.6)
+#  Скрипт базовой настройки и hardening Linux-сервера (v2.7)
 #  Поддержка: Ubuntu 20.04/22.04/24.04, Debian 11/12
 #  Запуск от имени root
 #
 #  Репозиторий: https://github.com/thealekseev/vps-setup
 #
-#  Изменения в v2.6:
-#   - ФИКС: убран "wait", который вызывал deadlock с "tee" и вешал
-#           скрипт после "База rkhunter обновлена"
-#   - ДОБАВЛЕНО: прогресс-бар [N/9], таймеры для длительных операций,
-#                индикация активности, чтобы отличать работу от зависания
+#  Изменения в v2.7:
+#   - ФИКС: TOTAL_STEPS = 10 (было 9 → давало "10/9, 111%")
+#   - ФИКС: get_public_ip использует IPv4 (-4), не IPv6
+#   - ФИКС: все read читают с /dev/tty (работа при "curl | bash")
+#   - ФИКС: service_restart_or_reload_ssh надёжно находит ssh/sshd
+#   - ФИКС: проверяется код возврата рестарта SSH
+#   - ФИКС: rkhunter с --nocolors, ненулевой код не считается ошибкой
 # ============================================================
 
 set -uo pipefail
@@ -35,7 +37,7 @@ err()  { echo -e "${RED}[x]${NC} $*"; }
 info() { echo -e "${BLUE}[i]${NC} $*"; }
 
 # ---------- Прогресс-бар ----------
-TOTAL_STEPS=9
+TOTAL_STEPS=10      # ИЗМЕНЕНО (v2.7): было 9, а step_start вызывается 10 раз
 CURRENT_STEP=0
 STEP_START_TS=0
 
@@ -66,7 +68,7 @@ step_done() {
     echo ""
 }
 
-# ---------- Запуск команды с таймером (для длительных операций) ----------
+# ---------- Запуск команды с таймером ----------
 run_timed() {
     local msg="$1"; shift
     local start=$(date +%s)
@@ -77,7 +79,6 @@ run_timed() {
     "$@" > "$tmpout" 2>&1 &
     local pid=$!
 
-    # Пока команда работает — показываем таймер
     while kill -0 "$pid" 2>/dev/null; do
         local elapsed=$(( $(date +%s) - start ))
         printf "\r  ${YELLOW}⏳${NC} %s  ${CYAN}[%ds]${NC}\033[K" "$msg" "$elapsed" >&3
@@ -87,7 +88,6 @@ run_timed() {
     wait "$pid" || rc=$?
     printf "\r\033[K" >&3
 
-    # Выводим накопленный вывод (пойдёт и в лог, через tee)
     if [ -s "$tmpout" ]; then
         cat "$tmpout"
     fi
@@ -102,11 +102,26 @@ run_timed() {
     return "$rc"
 }
 
+# ---------- Чтение из терминала (работает при "curl | bash") ----------
+# ИЗМЕНЕНО (v2.7): < /dev/tty гарантирует чтение с терминала, а не из pipe
+read_tty() {
+    local __var="$1"
+    local __prompt="$2"
+    local __val=""
+    if [ -r /dev/tty ]; then
+        read -r -p "$(echo -e "${YELLOW}${__prompt}${NC}")" __val < /dev/tty
+    else
+        # fallback для нестандартных окружений
+        read -r -p "$(echo -e "${YELLOW}${__prompt}${NC}")" __val
+    fi
+    printf -v "$__var" '%s' "$__val"
+}
+
 # ---------- Вспомогательные функции ----------
 confirm() {
     local prompt="$1"
     local answer
-    read -r -p "$(echo -e "${YELLOW}${prompt} [y/N]: ${NC}")" answer
+    read_tty answer "${prompt} [y/N]: "
     [[ "$answer" =~ ^[Yy]$ ]]
 }
 
@@ -131,29 +146,45 @@ validate_username() {
     return 0
 }
 
+# ИЗМЕНЕНО (v2.7): надёжное определение сервиса через systemctl cat
 service_restart_or_reload_ssh() {
-    local unit
-    if systemctl list-unit-files | grep -q '^ssh\.service'; then
+    local unit=""
+
+    if systemctl cat ssh.service >/dev/null 2>&1; then
         unit="ssh"
-    elif systemctl list-unit-files | grep -q '^sshd\.service'; then
+    elif systemctl cat sshd.service >/dev/null 2>&1; then
         unit="sshd"
-    else
-        err "Не найден сервис ssh/sshd"
+    fi
+
+    if [ -z "$unit" ]; then
+        err "Не найден сервис ssh/sshd (проверьте вручную: systemctl status ssh)"
         return 1
     fi
 
     if ! sshd -t; then
-        err "Конфигурация SSH некорректна. Перезапуск отменён."
+        err "Конфигурация SSH некорректна (sshd -t). Перезапуск отменён."
         return 1
     fi
 
-    systemctl reload "$unit" 2>/dev/null || systemctl restart "$unit"
-    log "SSH перезапущен (${unit})"
+    if systemctl reload "$unit" 2>/dev/null; then
+        log "SSH перезагружен без разрыва сессии (${unit})"
+        return 0
+    fi
+
+    if systemctl restart "$unit"; then
+        log "SSH перезапущен (${unit})"
+        return 0
+    fi
+
+    err "Не удалось перезапустить ${unit}"
+    return 1
 }
 
+# ИЗМЕНЕНО (v2.7): только IPv4
 get_public_ip() {
-    curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null \
-      || curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null \
+    curl -4 -fsS --max-time 5 https://ifconfig.me 2>/dev/null \
+      || curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null \
+      || curl -4 -fsS --max-time 5 https://ipv4.icanhazip.com 2>/dev/null \
       || echo "unknown"
 }
 
@@ -188,7 +219,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 log "Проверка блокировки пакетного менеджера..."
 while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-    warn "Пакетный менеджер заблокирован (возможно, работают фоновые обновления). Ждем 10 секунд..."
+    warn "Пакетный менеджер заблокирован. Ждём 10 секунд..."
     sleep 10
 done
 
@@ -202,7 +233,7 @@ run_timed "apt-get upgrade" apt-get -y \
     -o Dpkg::Options::="--force-confold" \
     upgrade || true
 run_timed "apt-get autoremove" apt-get -y autoremove || true
-run_timed "apt-get autoclean" apt-get -y autoclean || true
+run_timed "apt-get autoclean"  apt-get -y autoclean  || true
 step_done
 
 # ============================================================
@@ -217,11 +248,11 @@ run_timed "Установка пакетов" apt-get install -y \
 step_done
 
 # ============================================================
-#  2.5. Создание Swap-файла (если отсутствует)
+#  3. Swap
 # ============================================================
 step_start "Проверка и настройка Swap"
 if [ "$(swapon --show=SIZE | wc -l)" -le 1 ]; then
-    warn "Swap не найден. Создаем файл подкачки 2GB для стабильности..."
+    warn "Swap не найден. Создаём файл подкачки 2GB..."
     run_timed "Создание swap-файла 2GB" bash -c '
         fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 2>/dev/null
         chmod 600 /swapfile
@@ -229,14 +260,14 @@ if [ "$(swapon --show=SIZE | wc -l)" -le 1 ]; then
         swapon /swapfile
     '
     echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    log "Swap-файл 2GB успешно создан и активирован."
+    log "Swap-файл 2GB создан и активирован."
 else
     info "Swap уже настроен, пропускаем."
 fi
 step_done
 
 # ============================================================
-#  3. Часовой пояс и синхронизация времени
+#  4. Часовой пояс
 # ============================================================
 step_start "Настройка времени (UTC)"
 timedatectl set-timezone "${TZ:-UTC}" 2>/dev/null || \
@@ -247,7 +278,7 @@ systemctl enable --now chrony 2>/dev/null || \
 step_done
 
 # ============================================================
-#  4. SSH-hardening
+#  5. SSH-hardening
 # ============================================================
 step_start "Настройка SSH (hardening)"
 
@@ -258,11 +289,11 @@ HARDENING_CONF="${SSHD_DIR}/99-hardening.conf"
 
 backup_file "$SSHD_CONFIG"
 
-# --- 4.1. Non-root пользователь с sudo ---
+# --- 5.1. Non-root пользователь ---
 NEW_USER=""
 if confirm "Создать non-root пользователя с правами sudo?"; then
     while true; do
-        read -r -p "$(echo -e "${YELLOW}Введите имя нового пользователя (латиница, цифры, _ и -): ${NC}")" NEW_USER
+        read_tty NEW_USER "Введите имя нового пользователя (латиница, цифры, _ и -): "
 
         if [ -z "$NEW_USER" ]; then
             warn "Имя не может быть пустым. Попробуйте снова."
@@ -291,7 +322,7 @@ if confirm "Создать non-root пользователя с правами s
     fi
 fi
 
-# --- 4.2. Проверка и генерация SSH-ключей ---
+# --- 5.2. SSH-ключи ---
 HAS_KEYS=0
 if [ -s /root/.ssh/authorized_keys ]; then HAS_KEYS=1; fi
 for dir in /home/*/.ssh; do
@@ -307,7 +338,7 @@ if [ "$HAS_KEYS" -eq 1 ]; then
         DISABLE_PASSWORD="yes"
     fi
 else
-    warn "SSH-ключи не найдены! Отключение пароля без ключей заблокирует доступ к серверу."
+    warn "SSH-ключи не найдены! Отключение пароля без ключей заблокирует доступ."
     if confirm "Сгенерировать новый SSH-ключ (ed25519) сейчас?"; then
         mkdir -p /root/.ssh
         chmod 700 /root/.ssh
@@ -335,14 +366,14 @@ else
                     /root/.ssh/authorized_keys "/home/${NEW_USER}/.ssh/authorized_keys"
             fi
         else
-            warn "Вход по паролю оставлен включенным."
+            warn "Вход по паролю оставлен включённым."
         fi
     else
         warn "Генерация ключей отменена."
     fi
 fi
 
-# --- 4.3. Смена порта SSH ---
+# --- 5.3. Смена порта ---
 NEW_SSH_PORT=""
 if confirm "Сменить стандартный SSH-порт (22)?"; then
     for _ in $(seq 1 20); do
@@ -358,7 +389,7 @@ if confirm "Сменить стандартный SSH-порт (22)?"; then
     log "Новый SSH-порт: ${NEW_SSH_PORT} (сохранён в /root/.new_ssh_port)"
 fi
 
-# --- 4.4. Записываем hardening-конфиг ---
+# --- 5.4. Hardening-конфиг ---
 if [ -n "$NEW_USER" ]; then
     ROOT_LOGIN_VAL="no"
 else
@@ -414,7 +445,7 @@ log "Конфигурация SSH прошла проверку (sshd -t)"
 step_done
 
 # ============================================================
-#  5. UFW Firewall (ПРАВИЛА ГОТОВИМ, НО НЕ ВКЛЮЧАЕМ!)
+#  6. UFW — правила готовим, но НЕ включаем
 # ============================================================
 step_start "Подготовка правил UFW (включение — в самом конце)"
 
@@ -451,11 +482,11 @@ ufw allow 80/tcp  comment 'HTTP'
 ufw allow 443/tcp comment 'HTTPS'
 ufw allow 443/udp comment 'QUIC/Hysteria2'
 
-info "Правила UFW подготовлены. Включение произойдёт в самом конце скрипта."
+info "Правила UFW подготовлены. Включение — в самом конце скрипта."
 step_done
 
 # ============================================================
-#  6. Fail2Ban
+#  7. Fail2Ban
 # ============================================================
 step_start "Настройка Fail2Ban"
 backup_file /etc/fail2ban/jail.local
@@ -486,13 +517,12 @@ fail2ban-client status sshd 2>/dev/null || warn "fail2ban ещё не видит
 step_done
 
 # ============================================================
-#  7. Sysctl-hardening
+#  8. Sysctl
 # ============================================================
 step_start "Настройка ядра (sysctl)"
 
 SYSCTL_CONF="/etc/sysctl.d/99-hardening.conf"
 cat > "$SYSCTL_CONF" <<'EOF'
-# --- Сетевая защита ---
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.tcp_syncookies = 1
@@ -508,12 +538,10 @@ net.ipv6.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_source_route = 0
 net.ipv6.conf.default.accept_source_route = 0
 
-# --- Логирование подозрительных пакетов ---
 net.ipv4.conf.all.log_martians = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
 
-# --- Защита от распространённых атак и оптимизация ---
 kernel.dmesg_restrict = 1
 kernel.kptr_restrict = 2
 kernel.yama.ptrace_scope = 1
@@ -528,7 +556,7 @@ log "Sysctl применён"
 step_done
 
 # ============================================================
-#  8. Автообновления безопасности
+#  9. Auto-upgrades
 # ============================================================
 step_start "Настройка unattended-upgrades"
 
@@ -554,7 +582,7 @@ fi
 step_done
 
 # ============================================================
-#  9. Финальные проверки и права
+#  10. Финал — rkhunter и права
 # ============================================================
 step_start "Финальные штрихи (rkhunter и права)"
 
@@ -562,14 +590,17 @@ chmod 700 /root
 chmod 700 /root/.ssh 2>/dev/null || true
 chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
 
-run_timed "rkhunter --update"  rkhunter --update  || true
-run_timed "rkhunter --propupd" rkhunter --propupd || true
-log "База rkhunter обновлена."
+# rkhunter: --nocolors, ошибки апдейта зеркал НЕ критичны
+# ИЗМЕНЕНО (v2.7): "Update failed" — это норма, зеркала rkhunter часто недоступны
+run_timed "rkhunter --update (может не работать — не критично)" \
+    rkhunter --update --nocolors || warn "rkhunter --update не удался (зеркала недоступны, не критично)"
+run_timed "rkhunter --propupd (локальная база)" \
+    rkhunter --propupd --nocolors || warn "rkhunter --propupd не удался"
+log "База rkhunter обновлена (локально)."
 step_done
 
 # ============================================================
 #  ИТОГОВАЯ СВОДКА
-#  (в v2.6 убран "wait" — он вызывал deadlock с tee)
 # ============================================================
 PUBLIC_IP="$(get_public_ip)"
 FINAL_PORT="${NEW_SSH_PORT:-22}"
@@ -581,10 +612,10 @@ echo -e "${GREEN}           НАСТРОЙКА СЕРВЕРА ЗАВЕРШЕНА
 echo -e "${GREEN}============================================================${NC}"
 echo ""
 echo -e "${YELLOW}📋 ИТОГОВАЯ КОНФИГУРАЦИЯ:${NC}"
-echo -e "  • IP-адрес сервера:             ${GREEN}${PUBLIC_IP}${NC}"
+echo -e "  • IP-адрес сервера (IPv4):      ${GREEN}${PUBLIC_IP}${NC}"
 echo -e "  • SSH-порт (новый):             ${RED}${FINAL_PORT}${NC}"
 echo -e "  • Пользователь для входа:       ${GREEN}${FINAL_USER}${NC}"
-echo -e "  • Root login по SSH:            ${RED}ограничен ключами или отключен${NC}"
+echo -e "  • Root login по SSH:            ${RED}ограничен ключами или отключён${NC}"
 echo -e "  • Password authentication:      ${RED}${DISABLE_PASSWORD}${NC}"
 echo -e "  • Лог скрипта:                  ${LOG_FILE}"
 if [ -f "/root/GENERATED_PRIVATE_KEY.txt" ]; then
@@ -613,7 +644,7 @@ if ! confirm "Применить правила UFW и перезапустит�
 fi
 
 # ============================================================
-#  10. ВКЛЮЧЕНИЕ UFW
+#  11. Включение UFW
 # ============================================================
 log "Применение правил UFW..."
 ufw --force enable
@@ -629,33 +660,42 @@ echo -e "${RED}• Если потеряли доступ — используй
 echo -e "${RED}============================================================${NC}"
 echo ""
 
-service_restart_or_reload_ssh
-
-echo ""
-echo -e "${GREEN}✅ SSH успешно перезапущен.${NC}"
+# ИЗМЕНЕНО (v2.7): проверяем код возврата, не печатаем "✅" если рестарт упал
+if service_restart_or_reload_ssh; then
+    echo ""
+    echo -e "${GREEN}✅ SSH успешно перезапущен.${NC}"
+    SSH_RESTART_OK=1
+else
+    echo ""
+    echo -e "${RED}❌ Не удалось перезапустить SSH. Проверьте конфигурацию:${NC}"
+    echo -e "   ${YELLOW}sudo sshd -t${NC}"
+    echo -e "   ${YELLOW}sudo systemctl status ssh${NC}"
+    SSH_RESTART_OK=0
+fi
 echo ""
 
 # ============================================================
-#  АВТОМАТИЧЕСКОЕ ЗАКРЫТИЕ СТАРОГО ПОРТА
+#  Закрытие старого порта
 # ============================================================
-if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
+if [ "${SSH_RESTART_OK:-0}" -eq 1 ] && \
+   [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
     echo -e "${YELLOW}============================================================${NC}"
     echo -e "${YELLOW}🔐 АВТОМАТИЧЕСКОЕ ЗАКРЫТИЕ СТАРОГО ПОРТА                   ${NC}"
     echo -e "${YELLOW}============================================================${NC}"
     echo ""
-    echo -e "${YELLOW}Старый порт ${CURRENT_SSH_PORT} временно открыт для сохранения текущей сессии.${NC}"
-    echo -e "${YELLOW}После подтверждения он будет автоматически закрыт.${NC}"
+    echo -e "${YELLOW}Старый порт ${CURRENT_SSH_PORT} временно открыт.${NC}"
+    echo -e "${YELLOW}Откройте НОВОЕ окно терминала и проверьте вход через порт ${FINAL_PORT}.${NC}"
     echo ""
 
-    if confirm "Вы успешно проверили подключение через новый порт ${FINAL_PORT}?"; then
+    if confirm "Подключение через новый порт ${FINAL_PORT} работает? Закрыть старый ${CURRENT_SSH_PORT}?"; then
         log "Закрываем старый SSH-порт ${CURRENT_SSH_PORT}..."
         ufw delete limit "${CURRENT_SSH_PORT}"/tcp >/dev/null 2>&1
-        log "Старый порт ${CURRENT_SSH_PORT} успешно закрыт."
+        log "Старый порт ${CURRENT_SSH_PORT} закрыт."
         echo ""
         echo -e "${GREEN}✅ Теперь доступен только новый порт: ${FINAL_PORT}${NC}"
     else
         warn "Закрытие старого порта отменено."
-        warn "Вы можете закрыть его позже командой: ufw delete limit ${CURRENT_SSH_PORT}/tcp"
+        warn "Закрыть позже: ufw delete limit ${CURRENT_SSH_PORT}/tcp"
     fi
 fi
 
@@ -665,7 +705,7 @@ echo -e "${GREEN}           НАСТРОЙКА ПОЛНОСТЬЮ ЗАВЕРШЕ
 echo -e "${GREEN}============================================================${NC}"
 echo ""
 echo -e "${GREEN}✅ Сервер настроен и защищён.${NC}"
-echo -e "${GREEN}   Используйте команду для подключения:${NC}"
+echo -e "${GREEN}   Подключение:${NC}"
 echo -e "   ${GREEN}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
 echo ""
 if [ -f "/root/GENERATED_PRIVATE_KEY.txt" ]; then
