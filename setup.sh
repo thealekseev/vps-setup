@@ -170,6 +170,9 @@ validate_username() {
     return 0
 }
 
+# Читает эффективное значение параметра из sshd_config.
+# `sshd -T` учитывает Include и drop-in файлы. Может вернуть non-zero
+# при warnings в конфиге — для нас это чисто информационный вызов.
 sshd_current() {
     local key="$1"
     local val=""
@@ -284,29 +287,29 @@ echo -e "${BLUE}║             ТЕКУЩАЯ КОНФИГУРАЦИЯ СИСТ
 echo -e "${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${YELLOW}SSH:${NC}"
-echo "    $(pad_right 'Порт:'                     $LABEL_WIDTH)${CUR_SSH_PORT}"
-echo "    $(pad_right 'PermitRootLogin:'          $LABEL_WIDTH)${CUR_PERMIT_ROOT_LOGIN:-<не задан>}"
-echo "    $(pad_right 'PasswordAuthentication:'   $LABEL_WIDTH)${CUR_PASSWORD_AUTH:-<не задан>}"
-echo "    $(pad_right 'PubkeyAuthentication:'     $LABEL_WIDTH)${CUR_PUBKEY_AUTH:-<не задан>}"
-echo "    $(pad_right 'ssh.socket:'               $LABEL_WIDTH)${CUR_SSH_SOCKET}"
+echo -e "    $(pad_right 'Порт:'                     $LABEL_WIDTH)${CUR_SSH_PORT}"
+echo -e "    $(pad_right 'PermitRootLogin:'          $LABEL_WIDTH)${CUR_PERMIT_ROOT_LOGIN:-<не задан>}"
+echo -e "    $(pad_right 'PasswordAuthentication:'   $LABEL_WIDTH)${CUR_PASSWORD_AUTH:-<не задан>}"
+echo -e "    $(pad_right 'PubkeyAuthentication:'     $LABEL_WIDTH)${CUR_PUBKEY_AUTH:-<не задан>}"
+echo -e "    $(pad_right 'ssh.socket:'               $LABEL_WIDTH)${CUR_SSH_SOCKET}"
 echo ""
 echo -e "  ${YELLOW}SSH-ключи:${NC}"
-echo "    $(pad_right 'root:'                     $LABEL_WIDTH)${CUR_KEYS_ROOT}"
+echo -e "    $(pad_right 'root:'                     $LABEL_WIDTH)${CUR_KEYS_ROOT}"
 if [ ${#CUR_KEYED_USERS[@]} -gt 0 ]; then
     for u in "${CUR_KEYED_USERS[@]}"; do
-        echo "    $(pad_right "${u}:" $LABEL_WIDTH)есть"
+        echo -e "    $(pad_right "${u}:" $LABEL_WIDTH)есть"
     done
 else
-    echo "    $(pad_right 'в /home/*/.ssh:' $LABEL_WIDTH)нет"
+    echo -e "    $(pad_right 'в /home/*/.ssh:' $LABEL_WIDTH)нет"
 fi
 echo ""
 echo -e "  ${YELLOW}Firewall и защита:${NC}"
-echo "    $(pad_right 'UFW:'                      $LABEL_WIDTH)${CUR_UFW_STATUS}"
-echo "    $(pad_right 'Fail2ban:'                 $LABEL_WIDTH)${CUR_F2B_STATUS}"
+echo -e "    $(pad_right 'UFW:'                      $LABEL_WIDTH)${CUR_UFW_STATUS}"
+echo -e "    $(pad_right 'Fail2ban:'                 $LABEL_WIDTH)${CUR_F2B_STATUS}"
 echo ""
 echo -e "  ${YELLOW}Прочее:${NC}"
-echo "    $(pad_right 'Swap:'                     $LABEL_WIDTH)${CUR_SWAP}"
-echo "    $(pad_right 'Временная зона:'           $LABEL_WIDTH)${CUR_TZ}"
+echo -e "    $(pad_right 'Swap:'                     $LABEL_WIDTH)${CUR_SWAP}"
+echo -e "    $(pad_right 'Временная зона:'           $LABEL_WIDTH)${CUR_TZ}"
 echo ""
 
 step_done
@@ -603,33 +606,33 @@ echo ""
 
 FINAL_PORT_PREVIEW="${NEW_SSH_PORT:-${CUR_SSH_PORT}}"
 
-echo "  $(pad_right 'Параметр' 24)Было → Станет"
-echo "  ────────────────────────────────────────────────────────"
+echo -e "  $(pad_right 'Параметр' 24)Было → Станет"
+echo -e "  ────────────────────────────────────────────────────────"
 
 if [ "$CUR_SSH_PORT" = "$FINAL_PORT_PREVIEW" ]; then
-    echo "  $(pad_right 'SSH-порт' 24)${CUR_SSH_PORT} (без изменений)"
+    echo -e "  $(pad_right 'SSH-порт' 24)${CUR_SSH_PORT} (без изменений)"
 else
-    echo "  $(pad_right 'SSH-порт' 24)${CUR_SSH_PORT} → ${FINAL_PORT_PREVIEW}"
+    echo -e "  $(pad_right 'SSH-порт' 24)${CUR_SSH_PORT} → ${FINAL_PORT_PREVIEW}"
 fi
 
 if [ "$CUR_PERMIT_ROOT_LOGIN" = "$ROOT_LOGIN_VAL" ]; then
-    echo "  $(pad_right 'PermitRootLogin' 24)${ROOT_LOGIN_VAL} (без изменений)"
+    echo -e "  $(pad_right 'PermitRootLogin' 24)${ROOT_LOGIN_VAL} (без изменений)"
 else
-    echo "  $(pad_right 'PermitRootLogin' 24)${CUR_PERMIT_ROOT_LOGIN:-?} → ${ROOT_LOGIN_VAL}"
+    echo -e "  $(pad_right 'PermitRootLogin' 24)${CUR_PERMIT_ROOT_LOGIN:-?} → ${ROOT_LOGIN_VAL}"
 fi
 
 if [ "$CUR_PASSWORD_AUTH" = "$DISABLE_PASSWORD" ]; then
-    echo "  $(pad_right 'PasswordAuthentication' 24)${DISABLE_PASSWORD} (без изменений)"
+    echo -e "  $(pad_right 'PasswordAuthentication' 24)${DISABLE_PASSWORD} (без изменений)"
 else
-    echo "  $(pad_right 'PasswordAuthentication' 24)${CUR_PASSWORD_AUTH:-?} → ${DISABLE_PASSWORD}"
+    echo -e "  $(pad_right 'PasswordAuthentication' 24)${CUR_PASSWORD_AUTH:-?} → ${DISABLE_PASSWORD}"
 fi
 
 if [ -n "$NEW_USER" ]; then
     CUR_ALLOW="${CUR_ALLOW_USERS:-<все>}"
-    echo "  $(pad_right 'AllowUsers' 24)${CUR_ALLOW} → ${NEW_USER}"
+    echo -e "  $(pad_right 'AllowUsers' 24)${CUR_ALLOW} → ${NEW_USER}"
 fi
 
-echo "  ────────────────────────────────────────────────────────"
+echo -e "  ────────────────────────────────────────────────────────"
 echo ""
 
 echo -e "  ${YELLOW}Пояснения:${NC}"
@@ -892,31 +895,31 @@ echo -e "${GREEN}           НАСТРОЙКА СЕРВЕРА ЗАВЕРШЕНА
 echo -e "${GREEN}============================================================${NC}"
 echo ""
 echo -e "${YELLOW}📋 ИТОГ:${NC}"
-echo "  • IP (IPv4):               ${GREEN}${PUBLIC_IP}${NC}"
-echo "  • SSH-порт:                ${RED}${FINAL_PORT}${NC}"
-echo "  • Пользователь:            ${GREEN}${FINAL_USER}${NC}"
-echo "  • Root login:              ${RED}${ROOT_LOGIN_VAL}${NC}"
-echo "  • Password auth:           ${RED}${DISABLE_PASSWORD}${NC}"
-echo "  • Часовой пояс:            ${GREEN}${FINAL_TZ}${NC}"
-echo "  • Лог:                     ${LOG_FILE}"
+echo -e "  • IP (IPv4):               ${GREEN}${PUBLIC_IP}${NC}"
+echo -e "  • SSH-порт:                ${RED}${FINAL_PORT}${NC}"
+echo -e "  • Пользователь:            ${GREEN}${FINAL_USER}${NC}"
+echo -e "  • Root login:              ${RED}${ROOT_LOGIN_VAL}${NC}"
+echo -e "  • Password auth:           ${RED}${DISABLE_PASSWORD}${NC}"
+echo -e "  • Часовой пояс:            ${GREEN}${FINAL_TZ}${NC}"
+echo -e "  • Лог:                     ${LOG_FILE}"
 
 [ -f /root/GENERATED_PRIVATE_KEY.txt ] && \
-    echo "  • Приватный ключ:          ${RED}/root/GENERATED_PRIVATE_KEY.txt${NC}"
+    echo -e "  • Приватный ключ:          ${RED}/root/GENERATED_PRIVATE_KEY.txt${NC}"
 [ -n "$NEW_SSH_PORT" ] && \
-    echo "  • Порт сохранён в:         /root/.new_ssh_port"
+    echo -e "  • Порт сохранён в:         /root/.new_ssh_port"
 if [ -n "$NEW_USER" ] && [ -f "/etc/sudoers.d/90-${NEW_USER}" ]; then
-    echo "  • Sudo для ${NEW_USER}:     ${YELLOW}NOPASSWD${NC} (см. /etc/sudoers.d/90-${NEW_USER})"
+    echo -e "  • Sudo для ${NEW_USER}:     ${YELLOW}NOPASSWD${NC} (см. /etc/sudoers.d/90-${NEW_USER})"
 fi
 
 SCRIPT_END=$(date +%s)
 TOTAL_ELAPSED=$((SCRIPT_END - SCRIPT_START))
 TOTAL_MIN=$((TOTAL_ELAPSED / 60))
 TOTAL_SEC=$((TOTAL_ELAPSED % 60))
-echo "  • Общее время выполнения:  ${GREEN}${TOTAL_MIN} мин ${TOTAL_SEC} сек${NC}"
+echo -e "  • Общее время выполнения:  ${GREEN}${TOTAL_MIN} мин ${TOTAL_SEC} сек${NC}"
 
 echo ""
 echo -e "${YELLOW}🔗 Подключение:${NC}"
-echo "  ${GREEN}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
+echo -e "  ${GREEN}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
 echo ""
 echo -e "${YELLOW}📋 UFW будет применён:${NC}"
 ufw status verbose
@@ -957,7 +960,7 @@ if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
     if confirm "Проверили вход через новый порт ${FINAL_PORT}?"; then
         ufw delete limit "${CURRENT_SSH_PORT}"/tcp >/dev/null 2>&1
         log "Старый порт ${CURRENT_SSH_PORT} закрыт."
-        echo "✅ Доступен только ${FINAL_PORT}."
+        echo -e "✅ Доступен только ${FINAL_PORT}."
     else
         warn "Закрыть позже: ufw delete limit ${CURRENT_SSH_PORT}/tcp"
     fi
@@ -970,7 +973,7 @@ echo -e "${GREEN}============================================================${N
 
 if [ -f /root/GENERATED_PRIVATE_KEY.txt ]; then
     echo -e "${YELLOW}⚠️  Удалите приватный ключ:${NC}"
-    echo "   ${RED}rm -f /root/GENERATED_PRIVATE_KEY.txt${NC}"
+    echo -e "   ${RED}rm -f /root/GENERATED_PRIVATE_KEY.txt${NC}"
 fi
 echo -e "${GREEN}Спасибо!${NC}"
 
@@ -980,14 +983,14 @@ echo -e "${GREEN}Спасибо!${NC}"
 echo ""
 if confirm "Перезагрузить сервер сейчас? (рекомендуется для применения всех изменений)"; then
     warn "Перезагрузка через 1 минуту. Отменить: shutdown -c"
-    echo "  Команда отмены: ${GREEN}shutdown -c${NC}"
+    echo -e "  Команда отмены: ${GREEN}shutdown -c${NC}"
     echo ""
     shutdown -r +1 "Server hardening завершён. Плановая перезагрузка."
-    echo "Сервер уйдёт на перезагрузку через 1 минуту."
-    echo "После перезагрузки подключение: ${YELLOW}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
+    echo -e "Сервер уйдёт на перезагрузку через 1 минуту."
+    echo -e "После перезагрузки подключение: ${YELLOW}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
 else
     warn "Перезагрузка отложена. Рекомендуется выполнить вручную:"
-    echo "  ${GREEN}sudo reboot${NC}"
+    echo -e "  ${GREEN}sudo reboot${NC}"
 fi
 echo ""
 
