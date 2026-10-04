@@ -1,9 +1,15 @@
 #!/bin/bash
 
 # ============================================================
-#  Скрипт базовой настройки и hardening Linux-сервера (v2.1 - ИСПРАВЛЕННЫЙ)
+#  Скрипт базовой настройки и hardening Linux-сервера (v2.2)
 #  Поддержка: Ubuntu 20.04/22.04/24.04, Debian 11/12
 #  Запуск от имени root
+#
+#  Изменения в v2.2:
+#   - Валидация имени нового пользователя
+#   - Итоговая конфигурация выводится ПЕРЕД перезапуском SSH
+#   - Явное предупреждение о разрыве текущей сессии
+#   - Готовая команда для повторного подключения в выводе
 # ============================================================
 
 set -uo pipefail
@@ -17,7 +23,6 @@ NC='\033[0m'
 
 # ---------- Логирование ----------
 LOG_FILE="/var/log/server-hardening.log"
-# Сохраняем оригинальный FD 1, чтобы можно было временно отключать логирование
 exec 3>&1
 exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -40,6 +45,23 @@ backup_file() {
         cp -a "$file" "${file}.bak.initial"
         info "Создана резервная копия: ${file}.bak.initial"
     fi
+}
+
+# Валидация имени пользователя Linux
+validate_username() {
+    local name="$1"
+    # Имя должно начинаться с буквы или _, содержать только буквы, цифры, _ и -
+    # Длина от 1 до 32 символов
+    if [[ ! "$name" =~ ^[a-z_][a-z0-9_-]*$ ]] || [ "${#name}" -gt 32 ] || [ -z "$name" ]; then
+        return 1
+    fi
+    # Проверка зарезервированных имён
+    case "$name" in
+        root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|gnats|nobody|systemd-*|sshd|ubuntu|debian)
+            return 1
+            ;;
+    esac
+    return 0
 }
 
 service_restart_or_reload_ssh() {
@@ -154,17 +176,32 @@ mkdir -p "$SSHD_DIR"
 HARDENING_CONF="${SSHD_DIR}/99-hardening.conf"
 backup_file "$SSHD_CONFIG"
 
-# --- 4.1. Non-root пользователь с sudo ---
+# --- 4.1. Non-root пользователь с sudo (С ВАЛИДАЦИЕЙ) ---
 NEW_USER=""
 if confirm "Создать non-root пользователя с правами sudo?"; then
-    read -r -p "Имя пользователя: " NEW_USER
-    if id "$NEW_USER" &>/dev/null; then
-        info "Пользователь $NEW_USER уже существует"
-    else
+    while true; do
+        read -r -p "$(echo -e "${YELLOW}Введите имя нового пользователя (латиница, цифры, _ и -): ${NC}")" NEW_USER
+        
+        if [ -z "$NEW_USER" ]; then
+            warn "Имя не может быть пустым. Попробуйте снова."
+            continue
+        fi
+        
+        if ! validate_username "$NEW_USER"; then
+            warn "Недопустимое имя пользователя. Используйте только латинские буквы, цифры, _ и -. Имя должно начинаться с буквы или _."
+            continue
+        fi
+        
+        if id "$NEW_USER" &>/dev/null; then
+            info "Пользователь $NEW_USER уже существует"
+            break
+        fi
+        
         adduser --disabled-password --gecos "" "$NEW_USER"
         usermod -aG sudo "$NEW_USER"
         log "Пользователь $NEW_USER создан и добавлен в группу sudo"
-    fi
+        break
+    done
 
     if [ -s /root/.ssh/authorized_keys ] && [ ! -s "/home/${NEW_USER}/.ssh/authorized_keys" ]; then
         install -d -m 700 -o "$NEW_USER" -g "$NEW_USER" "/home/${NEW_USER}/.ssh"
@@ -176,7 +213,6 @@ fi
 # --- 4.2. Проверка и интерактивная генерация SSH-ключей ---
 HAS_KEYS=0
 if [ -s /root/.ssh/authorized_keys ]; then HAS_KEYS=1; fi
-# Безопасная проверка домашних директорий
 for dir in /home/*/.ssh; do
     if [ -d "$dir" ] && [ -s "$dir/authorized_keys" ]; then
         HAS_KEYS=1
@@ -198,7 +234,6 @@ else
         cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
         chmod 600 /root/.ssh/authorized_keys
         
-        # ИСПРАВЛЕНИЕ: Не выводим ключ в общий лог. Сохраняем в защищенный файл.
         KEY_FILE="/root/GENERATED_PRIVATE_KEY.txt"
         cp /root/.ssh/id_ed25519 "$KEY_FILE"
         chmod 400 "$KEY_FILE"
@@ -243,7 +278,6 @@ if confirm "Сменить стандартный SSH-порт (22)?"; then
 fi
 
 # --- 4.4. Записываем hardening-конфиг ---
-# ИСПРАВЛЕНИЕ: Корректная логика для PermitRootLogin
 if [ -n "$NEW_USER" ]; then
     ROOT_LOGIN_VAL="no"
 else
@@ -429,55 +463,62 @@ rkhunter --update >/dev/null 2>&1 || true
 rkhunter --propupd >/dev/null 2>&1 || true
 log "База rkhunter обновлена."
 
-service_restart_or_reload_ssh
-
 # ============================================================
-#  Итог
+#  ИТОГОВАЯ СВОДКА (ПЕРЕД ПЕРЕЗАПУСКОМ SSH)
 # ============================================================
 PUBLIC_IP="$(get_public_ip)"
 FINAL_PORT="${NEW_SSH_PORT:-22}"
 FINAL_USER="${NEW_USER:-root}"
 
-# ИСПРАВЛЕНИЕ: Ожидаем завершения фоновых процессов tee перед выводом финального сообщения
 wait
 
 echo ""
 echo -e "${GREEN}============================================================${NC}"
-echo -e "${GREEN}           Настройка сервера завершена успешно!             ${NC}"
+echo -e "${GREEN}           НАСТРОЙКА СЕРВЕРА ЗАВЕРШЕНА!                     ${NC}"
 echo -e "${GREEN}============================================================${NC}"
 echo ""
-echo -e "${YELLOW}ВАЖНАЯ ИНФОРМАЦИЯ:${NC}"
+echo -e "${YELLOW}📋 ИТОГОВАЯ КОНФИГУРАЦИЯ:${NC}"
+echo -e "  • IP-адрес сервера:             ${GREEN}${PUBLIC_IP}${NC}"
 echo -e "  • SSH-порт:                     ${RED}${FINAL_PORT}${NC}"
+echo -e "  • Пользователь для входа:       ${GREEN}${FINAL_USER}${NC}"
 echo -e "  • Root login по SSH:            ${RED}ограничен ключами или отключен${NC}"
 echo -e "  • Password authentication:      ${RED}${DISABLE_PASSWORD}${NC}"
-if [ -n "$NEW_USER" ]; then
-    echo -e "  • Пользователь с sudo:          ${GREEN}${NEW_USER}${NC}"
-fi
 echo -e "  • Лог скрипта:                  ${LOG_FILE}"
 if [ -f "/root/GENERATED_PRIVATE_KEY.txt" ]; then
     echo -e "  • ПРИВАТНЫЙ КЛЮЧ СОХРАНЕН В:      ${RED}/root/GENERATED_PRIVATE_KEY.txt${NC}"
 fi
-echo -e "  • Порт сохранён в:              /root/.new_ssh_port"
+if [ -n "$NEW_SSH_PORT" ]; then
+    echo -e "  • Порт сохранён в:              /root/.new_ssh_port"
+fi
 echo ""
-echo -e "${YELLOW}СЛЕДУЮЩИЕ ШАГИ:${NC}"
-echo "  1. НЕ ЗАКРЫВАЙТЕ текущую SSH-сессию!"
-echo "  2. Откройте НОВОЕ окно терминала и проверьте вход:"
+echo -e "${YELLOW}🔗 КОМАНДА ДЛЯ ПОДКЛЮЧЕНИЯ (скопируйте!):${NC}"
 if [ -n "$NEW_USER" ]; then
-    echo "       ssh -p ${FINAL_PORT} ${NEW_USER}@${PUBLIC_IP}"
+    echo -e "  ${GREEN}ssh -p ${FINAL_PORT} ${NEW_USER}@${PUBLIC_IP}${NC}"
 else
-    echo "       ssh -p ${FINAL_PORT} root@${PUBLIC_IP}"
-    if [ "$DISABLE_PASSWORD" = "yes" ]; then
-        echo "       (Убедитесь, что вы используете SSH-ключ: ssh -i /path/to/key ...)"
-    fi
+    echo -e "  ${GREEN}ssh -p ${FINAL_PORT} root@${PUBLIC_IP}${NC}"
 fi
-echo "  3. Если вход успешен — можно закрывать старую сессию."
-echo "  4. Проверьте статус: ufw status; fail2ban-client status sshd"
 echo ""
-if [ "$DISABLE_PASSWORD" = "no" ]; then
-    echo -e "${RED}⚠  ВНИМАНИЕ: Вход по паролю все еще включен.${NC}"
-    echo -e "${RED}   После настройки SSH-ключей отключите его вручную:${NC}"
-    echo -e "${RED}   nano /etc/ssh/sshd_config.d/99-hardening.conf${NC}"
-    echo -e "${RED}   (установите PasswordAuthentication no и сделайте systemctl reload ssh)${NC}"
+echo -e "${RED}============================================================${NC}"
+echo -e "${RED}⚠️  ВНИМАНИЕ! СЕЙЧАС ПРОИЗОЙДЁТ ПЕРЕЗАПУСК SSH               ${NC}"
+echo -e "${RED}============================================================${NC}"
+echo -e "${RED}• Ваша ТЕКУЩАЯ SSH-сессия будет РАЗОРВАНА!                   ${NC}"
+echo -e "${RED}• СКОПИРУЙТЕ команду для подключения ВЫШЕ, прежде чем         ${NC}"
+echo -e "${RED}  продолжать!                                                 ${NC}"
+echo -e "${RED}• Откройте НОВОЕ окно терминала и проверьте вход.             ${NC}"
+echo -e "${RED}• Если потеряли доступ — используйте VNC-консоль хостинга.    ${NC}"
+echo -e "${RED}============================================================${NC}"
+echo ""
+
+if ! confirm "Вы готовы к перезапуску SSH? Текущая сессия будет разорвана"; then
+    warn "Перезапуск SSH отменён пользователем."
+    warn "Чтобы применить настройки позже, выполните: systemctl reload ssh"
+    exit 0
 fi
-echo -e "${RED}Если потеряли доступ — используйте VNC-консоль вашего хостинг-провайдера.${NC}"
+
+# Перезапуск SSH — ПОСЛЕДНИМ шагом, с проверкой и reload
+service_restart_or_reload_ssh
+
+echo ""
+echo -e "${GREEN}✅ SSH успешно перезапущен. Текущая сессия может быть разорвана.${NC}"
+echo -e "${GREEN}   Используйте команду выше для повторного подключения.${NC}"
 echo ""
