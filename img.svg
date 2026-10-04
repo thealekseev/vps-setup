@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300"
+     font-family="Inter, 'Segoe UI', Roboto, Arial, sans-serif"
+     role="img" aria-label="VDSINA — хостинг VPS и VDS">
+  <a href="https://www.vdsina.com/?partner=f963ce3tpyrr" target="_blank">
+    <rect width="1200" height="300" fill="transparent"/>
+
+  <defs>
+    <!-- Фон -->
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0"   stop-color="#070C18"/>
+      <stop offset="0.5" stop-color="#0D1730"/>
+      <stop offset="1"   stop-color="#132349"/>
+    </linearGradient>
+
+    <!-- Свечение -->
+    <radialGradient id="glow">
+      <stop offset="0" stop-color="#3D8BFF" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#3D8BFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Акцент (лого) -->
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4A9BFF"/>
+      <stop offset="1" stop-color="#00D4FF"/>
+    </linearGradient>
+
+    <!-- Кнопка -->
+    <linearGradient id="cta" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2E7DFF"/>
+      <stop offset="1" stop-color="#00C8FF"/>
+    </linearGradient>
+
+    <!-- Затухание сетки -->
+    <linearGradient id="fadeGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0.08"/>
+    </linearGradient>
+
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0 H0 V40" fill="none" stroke="#4E7BC4" stroke-width="1"/>
+    </pattern>
+
+    <mask id="fade">
+      <rect width="1200" height="300" fill="url(#fadeGrad)"/>
+    </mask>
+
+    <filter id="btnGlow" x="-40%" y="-100%" width="180%" height="300%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+
+  <!-- ===== ФОН ===== -->
+  <rect width="1200" height="300" fill="url(#bg)"/>
+  <rect width="1200" height="300" fill="url(#grid)" mask="url(#fade)" opacity="0.16"/>
+  <circle cx="1130" cy="20"  r="280" fill="url(#glow)"/>
+  <circle cx="120"  cy="300" r="220" fill="url(#glow)" opacity="0.45"/>
+
+  <!-- Акцентная полоса слева -->
+  <rect x="0" y="0" width="6" height="300" fill="url(#accent)"/>
+
+  <!-- ===== ЛОГОТИП + ПОДПИСЬ (отцентрированы по высоте) ===== -->
+  <image href="https://www.vdsina.com/img/v201805/content-images/white-logo-19.svg"
+         x="60" y="96" width="220" height="76"
+         preserveAspectRatio="xMinYMid meet"/>
+
+  <text x="60" y="196" font-size="18" font-weight="500" fill="#7E96BC" letter-spacing="0.3">
+    VPS и VDS <tspan>в Нидерландах</tspan>
+  </text>
+
+  <!-- Разделитель -->
+  <line x1="400" y1="80" x2="400" y2="220" stroke="#28406B" stroke-width="1"/>
+
+  <!-- ===== ЦЕНТР: ОФФЕР ===== -->
+  <text x="440" y="146" font-size="38" font-weight="700" fill="#FFFFFF">VPS за 60 секунд</text>
+  <text x="440" y="184" font-size="19" font-weight="500" fill="#8DA3C7">NVMe · DDoS-защита</text>
+  <text x="440" y="204" font-size="19" font-weight="500" fill="#8DA3C7">Русскоязычная поддержка 24/7</text>
+
+  <!-- ===== СПРАВА: ЦЕНА + CTA ===== -->
+  <text x="1020" y="122" text-anchor="middle" font-size="30" font-weight="700" fill="#FFFFFF">от 2 $/мес</text>
+
+  <rect x="900" y="144" width="240" height="64" rx="32" fill="#2E7DFF" opacity="0.5" filter="url(#btnGlow)"/>
+  <rect x="900" y="144" width="240" height="64" rx="32" fill="url(#cta)"/>
+  <text x="1020" y="184" text-anchor="middle" font-size="21" font-weight="700" fill="#06101F">Заказать сервер</text>
+
+  </a>
+</svg>
