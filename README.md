@@ -1,3 +1,4 @@
+[![VDSINA — хостинг VPS и VDS](assets/img.svg)](https://www.vdsina.com/?partner=f963ce3tpyrr)
 # VPS Setup
 
 Скрипт для комплексной первичной настройки и защиты VPS-сервера на базе Debian/Ubuntu.
