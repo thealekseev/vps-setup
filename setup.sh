@@ -30,6 +30,10 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[x]${NC} $*"; }
 info() { echo -e "${BLUE}[i]${NC} $*"; }
 
+# Глобальный обработчик ошибок.
+# ВАЖНО: ошибки, которые мы ожидаем и обрабатываем сами (внутри run_timed,
+# внутри if/||/&&, или явно помеченные `|| true`), НЕ должны доходить
+# до этого trap — иначе на экран будут лететь ложные красные сообщения.
 trap 'err "Непредвиденная ошибка в строке $LINENO. Лог: $LOG_FILE. Соединение НЕ перезапущено. Проверьте: sshd -t"' ERR
 
 # ---------- Управление шагами ----------
@@ -73,7 +77,7 @@ _heartbeat() {
             elapsed=$((now - start))
             if [ $((tick % 6)) -eq 0 ]; then
                 printf '  … %s — всё ещё выполняется (%s сек.)\n' \
-                    "$desc" "$elapsed"
+                    "$desc" "$elapsed" || true
             fi
         fi
     done
@@ -84,15 +88,25 @@ run_timed() {
     local start end rc hb_pid
     echo -e "  ${CYAN}↳${NC} $desc"
     start=$(date +%s)
+
     _heartbeat "$desc" "$start" &
     hb_pid=$!
-    "$@" >> "$LOG_FILE" 2>&1
-    rc=$?
-    kill "$hb_pid" 2>/dev/null
+
+    # ИЗМЕНЕНИЕ: команда обёрнута в `|| rc=$?`, чтобы её ненулевой код
+    # возврата не долетел до глобального trap ERR. Мы сами решаем, что
+    # делать с ошибкой: вернём rc наверх, а вызывающий код проверит
+    # через `if ! ...` или `... || true`.
+    rc=0
+    "$@" >> "$LOG_FILE" 2>&1 || rc=$?
+
+    # kill может вернуть 1, если процесс-читатель уже умер сам — это не ошибка.
+    kill "$hb_pid" 2>/dev/null || true
     wait "$hb_pid" 2>/dev/null || true
+
     if [ "$SPINNER_ENABLED" -eq 1 ]; then
         printf '\r\033[K' >&3 2>/dev/null || true
     fi
+
     end=$(date +%s)
     if [ "$rc" -eq 0 ]; then
         echo -e "  ${GREEN}✓${NC} $desc — $((end - start)) сек."
@@ -110,7 +124,9 @@ step_done() {
 # ---------- Вспомогательные функции ----------
 confirm() {
     local prompt="$1" answer
-    read -r -p "$(echo -e "${YELLOW}${prompt} [y/N]: ${NC}")" answer < /dev/tty
+    # read может вернуть non-zero при Ctrl-D (EOF) — это не ошибка скрипта,
+    # поэтому глушим трап через `|| true`, а пустой ответ = «нет».
+    read -r -p "$(echo -e "${YELLOW}${prompt} [y/N]: ${NC}")" answer < /dev/tty || true
     [[ "$answer" =~ ^[Yy]$ ]]
 }
 
@@ -370,7 +386,7 @@ if command -v timedatectl >/dev/null 2>&1; then
         echo -e "  ${CYAN}Пустой ввод — оставить ${CUR_TZ_NOW}.${NC}"
         echo ""
 
-        read -r -p "$(echo -e "${YELLOW}Часовой пояс: ${NC}")" TZ_INPUT < /dev/tty
+        read -r -p "$(echo -e "${YELLOW}Часовой пояс: ${NC}")" TZ_INPUT < /dev/tty || true
 
         SELECTED_TZ=""
         if [ -z "$TZ_INPUT" ]; then
@@ -425,9 +441,6 @@ HARDENING_CONF="${SSHD_DIR}/00-hardening.conf"
 backup_file "$SSHD_CONFIG"
 
 # Подчищаем старые версии нашего конфига от предыдущих запусков.
-# Если оставить 99-hardening.conf рядом с 00-hardening.conf, значения
-# могут конфликтовать (первое побеждает — наш 00 будет выигрывать, но
-# лучше не оставлять мусор).
 if [ -f "${SSHD_DIR}/99-hardening.conf" ] && [ "$HARDENING_CONF" != "${SSHD_DIR}/99-hardening.conf" ]; then
     warn "Найден устаревший ${SSHD_DIR}/99-hardening.conf — удаляем."
     rm -f "${SSHD_DIR}/99-hardening.conf"
@@ -438,7 +451,7 @@ NEW_USER=""
 USER_JUST_CREATED=0
 if confirm "Создать non-root пользователя с правами sudo?"; then
     while true; do
-        read -r -p "$(echo -e "${YELLOW}Имя пользователя: ${NC}")" NEW_USER < /dev/tty
+        read -r -p "$(echo -e "${YELLOW}Имя пользователя: ${NC}")" NEW_USER < /dev/tty || true
         [ -z "$NEW_USER" ] && { warn "Пустое имя."; continue; }
         validate_username "$NEW_USER" || { warn "Недопустимое имя."; continue; }
         break
@@ -651,8 +664,9 @@ fi
 # с раскомментированными директивами. Так как в OpenSSH первое значение
 # побеждает, эти файлы могут полностью обнулить наши настройки.
 # Комментируем конфликтующие директивы во всех drop-in, кроме нашего,
-# и в основном sshd_config.
-CONFLICT_KEYS='^(PasswordAuthentication|PermitRootLogin|PubkeyAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|AllowUsers|AllowGroups|Port)[[:space:]]'
+# и в основном sshd_config. Регулярка допускает ведущие пробелы/табы,
+# чтобы поймать отступы вида "    Port 22".
+CONFLICT_KEYS='^[[:space:]]*(PasswordAuthentication|PermitRootLogin|PubkeyAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|AllowUsers|AllowGroups|Port)[[:space:]]'
 
 shopt -s nullglob
 for f in "${SSHD_DIR}"/*.conf; do
@@ -669,6 +683,15 @@ if grep -Eq "$CONFLICT_KEYS" "$SSHD_CONFIG"; then
     backup_file "$SSHD_CONFIG"
     sed -i -E "s|${CONFLICT_KEYS}|# [hardening] &|" "$SSHD_CONFIG"
     info "Закомментированы конфликтующие директивы в ${SSHD_CONFIG}"
+fi
+
+# --- Include в НАЧАЛО sshd_config ---
+# First Match Wins: если Include в конце файла, то все раскомментированные
+# директивы выше (MaxAuthTries, X11Forwarding и т.п.) перебьют наш drop-in.
+# Поэтому вставляем Include строго в первую строку.
+if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*' "$SSHD_CONFIG"; then
+    sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' "$SSHD_CONFIG"
+    info "Include добавлен в начало ${SSHD_CONFIG}"
 fi
 
 # --- Пишем наш конфиг ---
@@ -701,10 +724,6 @@ EOF
 [ -n "$NEW_USER" ]     && echo "AllowUsers ${NEW_USER}" >> "$HARDENING_CONF"
 [ -n "$NEW_SSH_PORT" ] && echo "Port ${NEW_SSH_PORT}"    >> "$HARDENING_CONF"
 
-if ! grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d/\*' "$SSHD_CONFIG"; then
-    echo "Include /etc/ssh/sshd_config.d/*.conf" >> "$SSHD_CONFIG"
-fi
-
 chown root:root "$SSHD_CONFIG" "$HARDENING_CONF"
 chmod 644 "$SSHD_CONFIG"
 chmod 600 "$HARDENING_CONF"
@@ -717,8 +736,6 @@ fi
 log "sshd -t OK (конфиг записан, но ещё не применён)"
 
 # --- 5.8. Перечитываем эффективные значения ---
-# sshd -T читает итоговый конфиг с диска, с учётом Include и всех
-# drop-in файлов, и показывает то, что реально увидит демон.
 ACTUAL_PASSWORD_AUTH="$(sshd_current passwordauthentication || true)"
 ACTUAL_PERMIT_ROOT_LOGIN="$(sshd_current permitrootlogin || true)"
 ACTUAL_SSH_PORT="$(sshd_current port || true)"
