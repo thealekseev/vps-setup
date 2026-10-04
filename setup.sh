@@ -652,15 +652,12 @@ AllowAgentForwarding no
 AllowTcpForwarding no
 PermitTunnel no
 GatewayPorts no
-PermitEmptyPorts 0
 PermitEmptyPasswords no
 UseDNS no
 LogLevel VERBOSE
 ClientAliveInterval 300
 ClientAliveCountMax 2
 EOF
-# Примечание: строка PermitEmptyPorts выше — артефакт шаблонизации.
-# Если её случайно занесло в heredoc — удалите. Проверьте через sshd -t.
 
 [ -n "$NEW_USER" ]     && echo "AllowUsers ${NEW_USER}" >> "$HARDENING_CONF"
 [ -n "$NEW_SSH_PORT" ] && echo "Port ${NEW_SSH_PORT}"    >> "$HARDENING_CONF"
@@ -680,10 +677,9 @@ if ! sshd -t; then
 fi
 log "sshd -t OK (конфиг записан, но ещё не применён)"
 
-# --- 5.8. ДВОЙНАЯ ЗАЩИТА: перечитываем эффективные значения ---
+# --- 5.8. Перечитываем эффективные значения ---
 # sshd -T читает итоговый конфиг с диска, с учётом Include и всех
-# drop-in файлов, и показывает то, что реально увидит демон. Если
-# эффективное значение не совпадает с ожидаемым — предупреждаем.
+# drop-in файлов, и показывает то, что реально увидит демон.
 ACTUAL_PASSWORD_AUTH="$(sshd_current passwordauthentication || true)"
 ACTUAL_PERMIT_ROOT_LOGIN="$(sshd_current permitrootlogin || true)"
 ACTUAL_SSH_PORT="$(sshd_current port || true)"
@@ -879,9 +875,6 @@ step_done
 # ============================================================
 #  ИТОГОВАЯ СВОДКА
 # ============================================================
-# В отчёте используем ACTUAL_* — значения, перечитанные из sshd -T
-# после записи конфига. Это защищает от ситуации, когда скрипт думает
-# одно, а в файле записано другое (или drop-in перекрыт другим файлом).
 PUBLIC_IP="$(get_public_ip)"
 FINAL_PORT="${ACTUAL_SSH_PORT:-${NEW_SSH_PORT:-${CURRENT_SSH_PORT:-22}}}"
 FINAL_USER="${NEW_USER:-root}"
