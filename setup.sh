@@ -1,16 +1,17 @@
 #!/bin/bash
 
 # ============================================================
-#  Скрипт базовой настройки и hardening Linux-сервера (v2.5)
+#  Скрипт базовой настройки и hardening Linux-сервера (v2.6)
 #  Поддержка: Ubuntu 20.04/22.04/24.04, Debian 11/12
 #  Запуск от имени root
 #
 #  Репозиторий: https://github.com/thealekseev/vps-setup
 #
-#  Изменения в v2.5:
-#   - UFW больше НЕ включается в шаге 5 (правила только готовятся)
-#   - Итоговая сводка + подтверждение → только ПОТОМ enable UFW
-#   - Это защищает текущую SSH-сессию от обрыва на rkhunter --update
+#  Изменения в v2.6:
+#   - ФИКС: убран "wait", который вызывал deadlock с "tee" и вешал
+#           скрипт после "База rkhunter обновлена"
+#   - ДОБАВЛЕНО: прогресс-бар [N/9], таймеры для длительных операций,
+#                индикация активности, чтобы отличать работу от зависания
 # ============================================================
 
 set -uo pipefail
@@ -20,6 +21,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 # ---------- Логирование ----------
@@ -31,6 +33,74 @@ log()  { echo -e "${GREEN}[+]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[x]${NC} $*"; }
 info() { echo -e "${BLUE}[i]${NC} $*"; }
+
+# ---------- Прогресс-бар ----------
+TOTAL_STEPS=9
+CURRENT_STEP=0
+STEP_START_TS=0
+
+step_start() {
+    CURRENT_STEP=$((CURRENT_STEP + 1))
+    STEP_START_TS=$(date +%s)
+    local title="$1"
+    local pct=$((CURRENT_STEP * 100 / TOTAL_STEPS))
+    local width=30
+    local filled=$((CURRENT_STEP * width / TOTAL_STEPS))
+    local empty=$((width - filled))
+    local bar=""
+    local i
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty;  i++)); do bar+="░"; done
+    echo ""
+    echo -e "${CYAN}┌──────────────────────────────────────────────────────────┐${NC}"
+    printf  "${CYAN}│${NC} Шаг %d/%d  [%s] %3d%%\n" "$CURRENT_STEP" "$TOTAL_STEPS" "$bar" "$pct"
+    echo -e "${CYAN}│${NC} ${YELLOW}▶${NC} ${title}"
+    echo -e "${CYAN}└──────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+}
+
+step_done() {
+    local dur=$(( $(date +%s) - STEP_START_TS ))
+    echo ""
+    echo -e "${GREEN}✓ Шаг ${CURRENT_STEP}/${TOTAL_STEPS} завершён за ${dur}с${NC}"
+    echo ""
+}
+
+# ---------- Запуск команды с таймером (для длительных операций) ----------
+run_timed() {
+    local msg="$1"; shift
+    local start=$(date +%s)
+    local tmpout
+    tmpout=$(mktemp)
+    local rc=0
+
+    "$@" > "$tmpout" 2>&1 &
+    local pid=$!
+
+    # Пока команда работает — показываем таймер
+    while kill -0 "$pid" 2>/dev/null; do
+        local elapsed=$(( $(date +%s) - start ))
+        printf "\r  ${YELLOW}⏳${NC} %s  ${CYAN}[%ds]${NC}\033[K" "$msg" "$elapsed" >&3
+        sleep 1
+    done
+
+    wait "$pid" || rc=$?
+    printf "\r\033[K" >&3
+
+    # Выводим накопленный вывод (пойдёт и в лог, через tee)
+    if [ -s "$tmpout" ]; then
+        cat "$tmpout"
+    fi
+    rm -f "$tmpout"
+
+    local dur=$(( $(date +%s) - start ))
+    if [ "$rc" -eq 0 ]; then
+        echo -e "  ${GREEN}✓${NC} ${msg} ${CYAN}(${dur}с)${NC}"
+    else
+        echo -e "  ${RED}✗${NC} ${msg} ${CYAN}(${dur}с, код ${rc})${NC}"
+    fi
+    return "$rc"
+}
 
 # ---------- Вспомогательные функции ----------
 confirm() {
@@ -125,55 +195,61 @@ done
 # ============================================================
 #  1. Обновление системы
 # ============================================================
-log "[1/9] Обновление пакетов и системы..."
-apt-get update -y
-apt-get -y \
+step_start "Обновление пакетов и системы"
+run_timed "apt-get update" apt-get update -y || true
+run_timed "apt-get upgrade" apt-get -y \
     -o Dpkg::Options::="--force-confdef" \
     -o Dpkg::Options::="--force-confold" \
-    upgrade
-apt-get -y autoremove
-apt-get -y autoclean
+    upgrade || true
+run_timed "apt-get autoremove" apt-get -y autoremove || true
+run_timed "apt-get autoclean" apt-get -y autoclean || true
+step_done
 
 # ============================================================
 #  2. Установка утилит
 # ============================================================
-log "[2/9] Установка базовых и защитных утилит..."
-apt-get install -y \
+step_start "Установка базовых и защитных утилит"
+run_timed "Установка пакетов" apt-get install -y \
     curl wget git unzip nano htop net-tools jq \
     ufw fail2ban \
     unattended-upgrades apt-listchanges needrestart \
-    chrony auditd rkhunter
+    chrony auditd rkhunter || true
+step_done
 
 # ============================================================
 #  2.5. Создание Swap-файла (если отсутствует)
 # ============================================================
-log "[2.5/9] Проверка и настройка Swap..."
+step_start "Проверка и настройка Swap"
 if [ "$(swapon --show=SIZE | wc -l)" -le 1 ]; then
     warn "Swap не найден. Создаем файл подкачки 2GB для стабильности..."
-    fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
+    run_timed "Создание swap-файла 2GB" bash -c '
+        fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 2>/dev/null
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null
+        swapon /swapfile
+    '
     echo '/swapfile none swap sw 0 0' >> /etc/fstab
     log "Swap-файл 2GB успешно создан и активирован."
 else
     info "Swap уже настроен, пропускаем."
 fi
+step_done
 
 # ============================================================
 #  3. Часовой пояс и синхронизация времени
 # ============================================================
-log "[3/9] Настройка времени (UTC рекомендуется для логов)..."
+step_start "Настройка времени (UTC)"
 timedatectl set-timezone "${TZ:-UTC}" 2>/dev/null || \
     warn "timedatectl недоступен, пропускаем (возможно, LXC контейнер)"
 
 systemctl enable --now chrony 2>/dev/null || \
     systemctl enable --now systemd-timesyncd 2>/dev/null || true
+step_done
 
 # ============================================================
 #  4. SSH-hardening
 # ============================================================
-log "[4/9] Настройка SSH..."
+step_start "Настройка SSH (hardening)"
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_DIR="/etc/ssh/sshd_config.d"
@@ -182,7 +258,7 @@ HARDENING_CONF="${SSHD_DIR}/99-hardening.conf"
 
 backup_file "$SSHD_CONFIG"
 
-# --- 4.1. Non-root пользователь с sudo (С ВАЛИДАЦИЕЙ) ---
+# --- 4.1. Non-root пользователь с sudo ---
 NEW_USER=""
 if confirm "Создать non-root пользователя с правами sudo?"; then
     while true; do
@@ -192,17 +268,14 @@ if confirm "Создать non-root пользователя с правами s
             warn "Имя не может быть пустым. Попробуйте снова."
             continue
         fi
-
         if ! validate_username "$NEW_USER"; then
-            warn "Недопустимое имя пользователя. Используйте только латинские буквы, цифры, _ и -. Имя должно начинаться с буквы или _."
+            warn "Недопустимое имя пользователя."
             continue
         fi
-
         if id "$NEW_USER" &>/dev/null; then
             info "Пользователь $NEW_USER уже существует"
             break
         fi
-
         adduser --disabled-password --gecos "" "$NEW_USER"
         usermod -aG sudo "$NEW_USER"
         log "Пользователь $NEW_USER создан и добавлен в группу sudo"
@@ -218,7 +291,7 @@ if confirm "Создать non-root пользователя с правами s
     fi
 fi
 
-# --- 4.2. Проверка и интерактивная генерация SSH-ключей ---
+# --- 4.2. Проверка и генерация SSH-ключей ---
 HAS_KEYS=0
 if [ -s /root/.ssh/authorized_keys ]; then HAS_KEYS=1; fi
 for dir in /home/*/.ssh; do
@@ -235,7 +308,7 @@ if [ "$HAS_KEYS" -eq 1 ]; then
     fi
 else
     warn "SSH-ключи не найдены! Отключение пароля без ключей заблокирует доступ к серверу."
-    if confirm "Сгенерировать новый SSH-ключ (ed25519) прямо сейчас и сохранить приватный ключ в файл?"; then
+    if confirm "Сгенерировать новый SSH-ключ (ed25519) сейчас?"; then
         mkdir -p /root/.ssh
         chmod 700 /root/.ssh
         ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N "" -C "root@$(hostname)" >/dev/null 2>&1
@@ -262,10 +335,10 @@ else
                     /root/.ssh/authorized_keys "/home/${NEW_USER}/.ssh/authorized_keys"
             fi
         else
-            warn "Вход по паролю оставлен включенным. Настройте ключи вручную позже."
+            warn "Вход по паролю оставлен включенным."
         fi
     else
-        warn "Генерация ключей отменена. Вход по паролю останется включенным."
+        warn "Генерация ключей отменена."
     fi
 fi
 
@@ -279,8 +352,7 @@ if confirm "Сменить стандартный SSH-порт (22)?"; then
             break
         fi
     done
-    [ -z "$NEW_SSH_PORT" ] && { err "Не удалось найти свободный порт после 20 попыток"; exit 1; }
-
+    [ -z "$NEW_SSH_PORT" ] && { err "Не удалось найти свободный порт"; exit 1; }
     echo "$NEW_SSH_PORT" > /root/.new_ssh_port
     chmod 600 /root/.new_ssh_port
     log "Новый SSH-порт: ${NEW_SSH_PORT} (сохранён в /root/.new_ssh_port)"
@@ -297,7 +369,6 @@ cat > "$HARDENING_CONF" <<EOF
 # Сгенерировано hardening-скриптом $(date -Iseconds)
 Protocol 2
 
-# Аутентификация
 PermitRootLogin ${ROOT_LOGIN_VAL}
 PasswordAuthentication ${DISABLE_PASSWORD}
 KbdInteractiveAuthentication no
@@ -308,7 +379,6 @@ MaxSessions 3
 LoginGraceTime 30
 MaxStartups 10:30:60
 
-# Прочее
 X11Forwarding no
 AllowAgentForwarding no
 AllowTcpForwarding no
@@ -324,7 +394,6 @@ EOF
 if [ -n "$NEW_USER" ]; then
     echo "AllowUsers ${NEW_USER}" >> "$HARDENING_CONF"
 fi
-
 if [ -n "$NEW_SSH_PORT" ]; then
     echo "Port ${NEW_SSH_PORT}" >> "$HARDENING_CONF"
 fi
@@ -342,41 +411,36 @@ if ! sshd -t; then
     exit 1
 fi
 log "Конфигурация SSH прошла проверку (sshd -t)"
+step_done
 
 # ============================================================
-#  5. UFW Firewall (ПРАВИЛА ГОТОВИМ, НО НЕ ВКЛЮЧАЕМ!)  # ИЗМЕНЕНО (v2.5)
+#  5. UFW Firewall (ПРАВИЛА ГОТОВИМ, НО НЕ ВКЛЮЧАЕМ!)
 # ============================================================
-log "[5/9] Подготовка правил UFW (включение — в самом конце)..."
+step_start "Подготовка правил UFW (включение — в самом конце)"
 
 sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw || echo 'IPV6=yes' >> /etc/default/ufw
 
-# Сбрасываем предыдущие правила. Пока UFW выключен — сессия не оборвётся.
 ufw --force reset >/dev/null 2>&1 || true
 ufw default deny incoming
 ufw default allow outgoing
 ufw default deny routed
 
-# --- Определяем порт ТЕКУЩЕЙ SSH-сессии ---
 CURRENT_SSH_PORT=""
 if [ -n "${SSH_CONNECTION:-}" ]; then
     CURRENT_SSH_PORT=$(echo "$SSH_CONNECTION" | awk '{print $4}')
 fi
-
 if [ -z "$CURRENT_SSH_PORT" ]; then
     CURRENT_SSH_PORT=$(ss -tnp state established '( dport = :22 or sport = :22 )' 2>/dev/null \
         | awk 'NR==1 {for(i=1;i<=NF;i++) if($i ~ /:/) {split($i,a,":"); print a[length(a)]; exit}}')
 fi
-
 CURRENT_SSH_PORT="${CURRENT_SSH_PORT:-22}"
 log "Текущий SSH-порт сессии: ${CURRENT_SSH_PORT}"
 
-# --- Открываем порт текущей сессии (чтобы не потерять доступ) ---
 if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
     ufw limit "${CURRENT_SSH_PORT}"/tcp comment 'SSH OLD (temporary)'
     warn "Добавлено правило: старый SSH-порт ${CURRENT_SSH_PORT} (временно)."
 fi
 
-# --- Открываем новый (или текущий) SSH-порт ---
 if [ -n "$NEW_SSH_PORT" ]; then
     ufw limit "${NEW_SSH_PORT}"/tcp comment 'SSH (limited)'
 else
@@ -388,11 +452,12 @@ ufw allow 443/tcp comment 'HTTPS'
 ufw allow 443/udp comment 'QUIC/Hysteria2'
 
 info "Правила UFW подготовлены. Включение произойдёт в самом конце скрипта."
+step_done
 
 # ============================================================
 #  6. Fail2Ban
 # ============================================================
-log "[6/9] Настройка Fail2Ban..."
+step_start "Настройка Fail2Ban"
 backup_file /etc/fail2ban/jail.local
 
 cat > /etc/fail2ban/jail.local <<EOF
@@ -418,11 +483,12 @@ systemctl enable fail2ban
 systemctl restart fail2ban
 sleep 2
 fail2ban-client status sshd 2>/dev/null || warn "fail2ban ещё не видит sshd (нормально, если журнал пуст)"
+step_done
 
 # ============================================================
 #  7. Sysctl-hardening
 # ============================================================
-log "[7/9] Настройка ядра (sysctl)..."
+step_start "Настройка ядра (sysctl)"
 
 SYSCTL_CONF="/etc/sysctl.d/99-hardening.conf"
 cat > "$SYSCTL_CONF" <<'EOF'
@@ -459,11 +525,12 @@ EOF
 
 sysctl --system >/dev/null
 log "Sysctl применён"
+step_done
 
 # ============================================================
 #  8. Автообновления безопасности
 # ============================================================
-log "[8/9] Настройка unattended-upgrades..."
+step_start "Настройка unattended-upgrades"
 
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
@@ -484,28 +551,29 @@ EOF
 else
     log "Автоматическая перезагрузка отключена."
 fi
+step_done
 
 # ============================================================
 #  9. Финальные проверки и права
 # ============================================================
-log "[9/9] Финальные штрихи..."
+step_start "Финальные штрихи (rkhunter и права)"
 
 chmod 700 /root
 chmod 700 /root/.ssh 2>/dev/null || true
 chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
 
-rkhunter --update >/dev/null 2>&1 || true
-rkhunter --propupd >/dev/null 2>&1 || true
+run_timed "rkhunter --update"  rkhunter --update  || true
+run_timed "rkhunter --propupd" rkhunter --propupd || true
 log "База rkhunter обновлена."
+step_done
 
 # ============================================================
-#  ИТОГОВАЯ СВОДКА (ПЕРЕД ВКЛЮЧЕНИЕМ UFW И ПЕРЕЗАПУСКОМ SSH!)  # ИЗМЕНЕНО (v2.5)
+#  ИТОГОВАЯ СВОДКА
+#  (в v2.6 убран "wait" — он вызывал deadlock с tee)
 # ============================================================
 PUBLIC_IP="$(get_public_ip)"
 FINAL_PORT="${NEW_SSH_PORT:-22}"
 FINAL_USER="${NEW_USER:-root}"
-
-wait
 
 echo ""
 echo -e "${GREEN}============================================================${NC}"
@@ -530,7 +598,6 @@ echo -e "${YELLOW}🔗 КОМАНДА ДЛЯ ПОДКЛЮЧЕНИЯ (скопи�
 echo -e "  ${GREEN}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
 echo ""
 
-# --- Показываем будущие правила UFW и запрашиваем подтверждение ---  # ИЗМЕНЕНО (v2.5)
 echo -e "${YELLOW}============================================================${NC}"
 echo -e "${YELLOW}📋 ПРАВИЛА FIREWALL (UFW), КОТОРЫЕ СЕЙЧАС БУДУТ ПРИМЕНЕНЫ:${NC}"
 echo -e "${YELLOW}============================================================${NC}"
@@ -546,7 +613,7 @@ if ! confirm "Применить правила UFW и перезапустит�
 fi
 
 # ============================================================
-#  10. ВКЛЮЧЕНИЕ UFW (теперь безопасно — правила уже готовы)  # ИЗМЕНЕНО (v2.5)
+#  10. ВКЛЮЧЕНИЕ UFW
 # ============================================================
 log "Применение правил UFW..."
 ufw --force enable
@@ -562,7 +629,6 @@ echo -e "${RED}• Если потеряли доступ — используй
 echo -e "${RED}============================================================${NC}"
 echo ""
 
-# Перезапуск SSH — ПОСЛЕДНИМ шагом
 service_restart_or_reload_ssh
 
 echo ""
