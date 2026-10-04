@@ -78,7 +78,6 @@ _heartbeat() {
     local tick=0
     local now elapsed
     # Кадры спиннера — символы Брайля, классика для CLI.
-    # Если терминал не в UTF-8, легко заменить на: | / - \
     local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
     local n=${#frames[@]}
 
@@ -120,7 +119,6 @@ run_timed() {
     # Вывод команды идёт НАПРЯМУЮ в лог-файл, минуя tee.
     # В терминале пользователь видит только спиннер и итоговую строку,
     # а в /var/log/server-hardening.log сохраняется весь вывод команды.
-    # O_APPEND гарантирует, что строки tee и нашей команды не порвут друг друга.
     "$@" >> "$LOG_FILE" 2>&1
     rc=$?
 
@@ -178,6 +176,14 @@ validate_username() {
     return 0
 }
 
+# Читает эффективное значение параметра из sshd_config.
+# Использует `sshd -T`, который учитывает Include и drop-in файлы.
+# Возвращает значение через stdout или пустоту, если параметр не найден.
+sshd_current() {
+    local key="$1"
+    sshd -T 2>/dev/null | awk -v k="$key" 'tolower($1)==k {print $2; exit}'
+}
+
 service_restart_or_reload_ssh() {
     local unit
     if systemctl list-unit-files | grep -q '^ssh\.service'; then
@@ -233,16 +239,91 @@ while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
     warn "dpkg занят фоновыми процессами (cloud-init), ждём 10 сек..."; sleep 10
 done
 
-# Определяем способ активации SSH. В новых версиях Ubuntu/Debian используется ssh.socket,
-# который игнорирует параметр Port в sshd_config. Запоминаем это для последующей коррекции.
-SSH_USES_SOCKET=0
+# ============================================================
+#  1. Предварительный анализ системы
+# ============================================================
+# Здесь мы ТОЛЬКО читаем текущее состояние и показываем его пользователю.
+# Ничего не меняется. Это нужно, чтобы пользователь заранее увидел,
+# из чего мы исходим, и что именно будет изменено в следующих шагах.
+step_start "Предварительный анализ системы"
+
+# --- Текущая конфигурация SSH (эффективная, с учётом include/drop-in) ---
+CUR_SSH_PORT="$(sshd_current port)";        CUR_SSH_PORT="${CUR_SSH_PORT:-22}"
+CUR_PERMIT_ROOT_LOGIN="$(sshd_current permitrootlogin)"
+CUR_PASSWORD_AUTH="$(sshd_current passwordauthentication)"
+CUR_PUBKEY_AUTH="$(sshd_current pubkeyauthentication)"
+CUR_ALLOW_USERS="$(sshd -T 2>/dev/null | awk '$1=="allowusers" {print $0}' | head -1)"
+
+# --- Наличие SSH-ключей ---
+CUR_KEYS_ROOT="нет"
+[ -s /root/.ssh/authorized_keys ] && CUR_KEYS_ROOT="есть"
+
+CUR_KEYS_USERS=""
+for d in /home/*/.ssh/authorized_keys; do
+    [ -s "$d" ] || continue
+    local_u="$(dirname "$(dirname "$d")" | xargs basename)"
+    CUR_KEYS_USERS="${CUR_KEYS_USERS}${local_u} (есть)\n"
+done
+
+# --- Socket-активация SSH ---
+CUR_SSH_SOCKET="нет"
 if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+    CUR_SSH_SOCKET="да (Ubuntu 22.10+/Debian 12+)"
     SSH_USES_SOCKET=1
-    warn "Обнаружена socket-activation (ssh.socket). Будет отключена при смене порта."
+else
+    SSH_USES_SOCKET=0
 fi
 
+# --- UFW ---
+CUR_UFW_STATUS="$(ufw status 2>/dev/null | head -1 | awk '{print $2}')"
+CUR_UFW_STATUS="${CUR_UFW_STATUS:-не установлен}"
+
+# --- Fail2ban ---
+CUR_F2B_STATUS="$(systemctl is-active fail2ban 2>/dev/null)"
+CUR_F2B_STATUS="${CUR_F2B_STATUS:-inactive}"
+
+# --- Swap / TZ ---
+CUR_SWAP="нет"
+swapon --show 2>/dev/null | grep -q . && CUR_SWAP="есть"
+CUR_TZ="$(timedatectl show -p Timezone --value 2>/dev/null)"
+CUR_TZ="${CUR_TZ:-unknown}"
+
+# --- Печатаем сводку ---
+echo ""
+echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║             ТЕКУЩАЯ КОНФИГУРАЦИЯ СИСТЕМЫ                 ║${NC}"
+echo -e "${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "  ${YELLOW}SSH:${NC}"
+printf "    %-28s %s\n" "Порт:"                     "${CUR_SSH_PORT}"
+printf "    %-28s %s\n" "PermitRootLogin:"         "${CUR_PERMIT_ROOT_LOGIN:-<не задан>}"
+printf "    %-28s %s\n" "PasswordAuthentication:"  "${CUR_PASSWORD_AUTH:-<не задан>}"
+printf "    %-28s %s\n" "PubkeyAuthentication:"    "${CUR_PUBKEY_AUTH:-<не задан>}"
+printf "    %-28s %s\n" "ssh.socket:"              "${CUR_SSH_SOCKET}"
+echo ""
+echo -e "  ${YELLOW}SSH-ключи:${NC}"
+printf "    %-28s %s\n" "root:"                    "${CUR_KEYS_ROOT}"
+if [ -n "$CUR_KEYS_USERS" ]; then
+    echo -e "$CUR_KEYS_USERS" | while IFS= read -r line; do
+        [ -n "$line" ] && printf "    %-28s %s\n" "$line"
+    done
+else
+    printf "    %-28s %s\n" "в /home/*/.ssh:"        "нет"
+fi
+echo ""
+echo -e "  ${YELLOW}Firewall и защита:${NC}"
+printf "    %-28s %s\n" "UFW:"                     "${CUR_UFW_STATUS}"
+printf "    %-28s %s\n" "Fail2ban:"                "${CUR_F2B_STATUS}"
+echo ""
+echo -e "  ${YELLOW}Прочее:${NC}"
+printf "    %-28s %s\n" "Swap:"                    "${CUR_SWAP}"
+printf "    %-28s %s\n" "Временная зона:"          "${CUR_TZ}"
+echo ""
+
+step_done
+
 # ============================================================
-#  1. Обновление системы
+#  2. Обновление системы
 # ============================================================
 step_start "Обновление пакетов"
 run_timed "apt-get update"   apt-get update -y  || true
@@ -254,7 +335,7 @@ run_timed "autoclean"        apt-get -y autoclean  || true
 step_done
 
 # ============================================================
-#  2. Установка утилит
+#  3. Установка утилит
 # ============================================================
 step_start "Установка утилит"
 if ! run_timed "apt-get install" apt-get install -y \
@@ -267,13 +348,12 @@ if ! run_timed "apt-get install" apt-get install -y \
 fi
 
 # Жёсткая проверка наличия критически важных бинарных файлов.
-# Если их нет, дальнейшее выполнение бессмысленно и опасно.
 command -v ufw            >/dev/null || { err "ufw не установлен, дальше нельзя"; exit 1; }
 command -v fail2ban-server >/dev/null || { err "fail2ban-server не установлен, дальше нельзя"; exit 1; }
 step_done
 
 # ============================================================
-#  3. Swap и время
+#  4. Swap и время
 # ============================================================
 step_start "Swap и время"
 # Портативная проверка наличия активного swap (работает на всех версиях util-linux)
@@ -293,8 +373,11 @@ systemctl enable --now chrony 2>/dev/null \
 step_done
 
 # ============================================================
-#  4. SSH hardening
+#  5. SSH hardening — планирование и применение
 # ============================================================
+# Здесь мы сначала собираем все решения пользователя, ничего не меняя.
+# Затем показываем итоговый план «текущее → планируемое» и запрашиваем
+# явное подтверждение. Только после этого пишем конфиг и применяем.
 step_start "SSH hardening"
 
 SSHD_CONFIG="/etc/ssh/sshd_config"
@@ -303,8 +386,9 @@ mkdir -p "$SSHD_DIR"
 HARDENING_CONF="${SSHD_DIR}/99-hardening.conf"
 backup_file "$SSHD_CONFIG"
 
-# --- 4.1. Создание non-root пользователя ---
+# --- 5.1. Создание non-root пользователя ---
 NEW_USER=""
+USER_JUST_CREATED=0
 if confirm "Создать non-root пользователя с правами sudo?"; then
     while true; do
         read -r -p "$(echo -e "${YELLOW}Имя пользователя: ${NC}")" NEW_USER < /dev/tty
@@ -313,7 +397,6 @@ if confirm "Создать non-root пользователя с правами s
         break
     done
 
-    USER_JUST_CREATED=0
     if id "$NEW_USER" &>/dev/null; then
         info "Пользователь $NEW_USER уже существует."
     else
@@ -348,7 +431,7 @@ if confirm "Создать non-root пользователя с правами s
     fi
 fi
 
-# --- 4.2. Управление SSH-ключами ---
+# --- 5.2. Управление SSH-ключами ---
 HAS_KEYS=0
 [ -s /root/.ssh/authorized_keys ] && HAS_KEYS=1
 for d in /home/*/.ssh; do
@@ -397,7 +480,10 @@ else
     fi
 fi
 
-# --- 4.3. Смена порта SSH ---
+# --- 5.3. Смена порта SSH (планирование) ---
+# Порт только генерируется и сохраняется в файл. Никаких действий с
+# ssh.socket или sshd пока не производится — всё это будет в фазе применения
+# ниже, после подтверждения плана.
 NEW_SSH_PORT=""
 if confirm "Сменить стандартный SSH-порт (22)?"; then
     for _ in $(seq 1 20); do
@@ -405,20 +491,10 @@ if confirm "Сменить стандартный SSH-порт (22)?"; then
         if ! ss -tln | grep -q ":${C} "; then NEW_SSH_PORT="$C"; break; fi
     done
     [ -z "$NEW_SSH_PORT" ] && { err "Не удалось найти свободный порт."; exit 1; }
-
-    echo "$NEW_SSH_PORT" > /root/.new_ssh_port; chmod 600 /root/.new_ssh_port
-    log "Новый SSH-порт: $NEW_SSH_PORT"
-
-    # Отключаем ssh.socket, иначе параметр Port в sshd_config будет проигнорирован
-    if [ "$SSH_USES_SOCKET" -eq 1 ]; then
-        log "Отключаем ssh.socket..."
-        systemctl disable --now ssh.socket 2>/dev/null || warn "disable ssh.socket не удался"
-        systemctl enable ssh.service 2>/dev/null || true
-        systemctl start ssh.service 2>/dev/null || true
-    fi
+    log "Сгенерирован новый SSH-порт: $NEW_SSH_PORT"
 fi
 
-# --- 4.4. Формирование конфигурации SSH ---
+# --- 5.4. Определение финальных значений ---
 # Собираем массив пользователей, у которых реально есть настроенные ключи
 declare -a KEYED_USERS=()
 [ -s /root/.ssh/authorized_keys ] && KEYED_USERS+=("root")
@@ -432,13 +508,116 @@ if [ ${#KEYED_USERS[@]} -eq 0 ] && [ "$DISABLE_PASSWORD" = "yes" ]; then
     DISABLE_PASSWORD="no"
 fi
 
-# Запрет прямого входа root разрешен только если у нового пользователя есть ключи
+# Запрет прямого входа root разрешен только если у нового пользователя есть ключи.
+# Это ключевой пункт политики: полное отключение root-логина делается только
+# когда у не-root пользователя есть рабочий ключ для аварийного входа.
 if [ -n "$NEW_USER" ] && [ -s "/home/${NEW_USER}/.ssh/authorized_keys" ]; then
     ROOT_LOGIN_VAL="no"
+    ROOT_LOGIN_REASON="у ${NEW_USER} есть ключ для аварийного входа"
 else
     ROOT_LOGIN_VAL="prohibit-password"
+    if [ -n "$NEW_USER" ]; then
+        ROOT_LOGIN_REASON="у ${NEW_USER} нет ключа — оставляем вход root по ключу"
+    else
+        ROOT_LOGIN_REASON="non-root пользователь не создаётся"
+    fi
 fi
 
+# ============================================================
+#  5.5. ПЛАН ИЗМЕНЕНИЙ SSH — показываем ДО применения
+# ============================================================
+echo ""
+echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║            ПЛАН ИЗМЕНЕНИЙ SSH                            ║${NC}"
+echo -e "${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
+echo ""
+
+# Определяем финальный порт для отображения
+FINAL_PORT_PREVIEW="${NEW_SSH_PORT:-${CUR_SSH_PORT}}"
+
+printf "  %-26s %s\n" "Параметр" "Было → Станет"
+echo "  ────────────────────────────────────────────────────────"
+
+# Порт
+if [ "$CUR_SSH_PORT" = "$FINAL_PORT_PREVIEW" ]; then
+    printf "  %-26s %s\n" "SSH-порт" "${CUR_SSH_PORT} (без изменений)"
+else
+    printf "  %-26s %s → %s\n" "SSH-порт" "${CUR_SSH_PORT}" "${FINAL_PORT_PREVIEW}"
+fi
+
+# PermitRootLogin
+if [ "$CUR_PERMIT_ROOT_LOGIN" = "$ROOT_LOGIN_VAL" ]; then
+    printf "  %-26s %s (без изменений)\n" "PermitRootLogin" "${ROOT_LOGIN_VAL}"
+else
+    printf "  %-26s %s → %s\n" "PermitRootLogin" \
+        "${CUR_PERMIT_ROOT_LOGIN:-?}" "${ROOT_LOGIN_VAL}"
+fi
+
+# PasswordAuthentication — ключевой пункт
+if [ "$CUR_PASSWORD_AUTH" = "$DISABLE_PASSWORD" ]; then
+    printf "  %-26s %s (без изменений)\n" "PasswordAuthentication" "${DISABLE_PASSWORD}"
+else
+    printf "  %-26s %s → %s\n" "PasswordAuthentication" \
+        "${CUR_PASSWORD_AUTH:-?}" "${DISABLE_PASSWORD}"
+fi
+
+# AllowUsers
+if [ -n "$NEW_USER" ]; then
+    CUR_ALLOW="${CUR_ALLOW_USERS:-<все>}"
+    printf "  %-26s %s → %s\n" "AllowUsers" "${CUR_ALLOW}" "${NEW_USER}"
+fi
+
+echo "  ────────────────────────────────────────────────────────"
+echo ""
+
+# Пояснения по ключевым пунктам
+echo -e "  ${YELLOW}Пояснения:${NC}"
+echo -e "    • ${CYAN}PermitRootLogin = ${ROOT_LOGIN_VAL}${NC}"
+echo -e "      ${ROOT_LOGIN_REASON}"
+if [ "$DISABLE_PASSWORD" = "yes" ]; then
+    echo -e "    • ${CYAN}PasswordAuthentication = no${NC}"
+    echo -e "      SSH-ключи найдены (${KEYED_USERS[*]}), вход по паролю будет отключён."
+    echo -e "      ${RED}⚠ Убедитесь, что вы можете войти по ключу, ДО отключения пароля!${NC}"
+else
+    echo -e "    • ${CYAN}PasswordAuthentication = yes${NC}"
+    echo -e "      Вход по паролю остаётся разрешённым."
+fi
+echo ""
+
+# --- 5.6. Финальное подтверждение ---
+if ! confirm "Применить эти изменения SSH?"; then
+    warn "Применение изменений SSH отменено пользователем."
+    warn "Конфиг sshd НЕ изменён. Сервис не перезапущен."
+    # Откатываем создание нового пользователя? Нет — пользователь может быть
+    # уже существующим, а его создание безопасно. Оставляем.
+    NEW_SSH_PORT=""
+    DISABLE_PASSWORD="no"
+    ROOT_LOGIN_VAL="prohibit-password"
+    # Отменяем дальнейшее выполнение скрипта — без SSH-плана остальное
+    # не имеет смысла.
+    echo ""
+    warn "Скрипт завершён по запросу пользователя (SSH-план отклонён)."
+    exec 1>&3 2>&1
+    wait 2>/dev/null || true
+    exit 0
+fi
+
+# --- 5.7. Применение конфигурации SSH ---
+# Отключаем ssh.socket (если он был), чтобы Port из sshd_config применялся
+if [ -n "$NEW_SSH_PORT" ] && [ "$SSH_USES_SOCKET" -eq 1 ]; then
+    log "Отключаем ssh.socket (иначе Port в sshd_config игнорируется)..."
+    systemctl disable --now ssh.socket 2>/dev/null || warn "disable ssh.socket не удался"
+    systemctl enable ssh.service 2>/dev/null || true
+    systemctl start ssh.service 2>/dev/null || true
+fi
+
+# Сохраняем новый порт для последующих шагов
+if [ -n "$NEW_SSH_PORT" ]; then
+    echo "$NEW_SSH_PORT" > /root/.new_ssh_port
+    chmod 600 /root/.new_ssh_port
+fi
+
+# Формируем конфиг drop-in
 cat > "$HARDENING_CONF" <<EOF
 # Сгенерировано hardening-скриптом $(date -Iseconds)
 
@@ -485,11 +664,11 @@ if ! sshd -t; then
     rm -f "$HARDENING_CONF"
     exit 1
 fi
-log "sshd -t OK"
+log "sshd -t OK (конфиг записан, но ещё не применён)"
 step_done
 
 # ============================================================
-#  5. UFW — подготовка правил без включения
+#  6. UFW — подготовка правил без включения
 # ============================================================
 step_start "Подготовка правил UFW"
 
@@ -546,7 +725,7 @@ info "Правила подготовлены. Включение — в сам�
 step_done
 
 # ============================================================
-#  6. Fail2Ban
+#  7. Fail2Ban
 # ============================================================
 step_start "Fail2Ban"
 backup_file /etc/fail2ban/jail.local
@@ -589,7 +768,7 @@ fail2ban-client status sshd 2>/dev/null || warn "fail2ban ещё не видит
 step_done
 
 # ============================================================
-#  7. Sysctl hardening
+#  8. Sysctl hardening
 # ============================================================
 step_start "Sysctl hardening"
 cat > /etc/sysctl.d/99-hardening.conf <<'EOF'
@@ -623,7 +802,7 @@ log "Sysctl применён"
 step_done
 
 # ============================================================
-#  8. Автообновления
+#  9. Автообновления
 # ============================================================
 step_start "unattended-upgrades"
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
@@ -647,7 +826,7 @@ fi
 step_done
 
 # ============================================================
-#  9. Финальные проверки
+#  10. Финальные проверки
 # ============================================================
 step_start "Финальные проверки"
 chmod 700 /root
@@ -708,7 +887,7 @@ if ! confirm "Применить UFW и перезапустить SSH?"; then
 fi
 
 # ============================================================
-#  10. Применение
+#  11. Применение
 # ============================================================
 log "Применение UFW..."
 ufw --force enable
@@ -729,7 +908,7 @@ fi
 echo ""
 
 # ============================================================
-#  11. Закрытие старого порта
+#  12. Закрытие старого порта
 # ============================================================
 if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
     echo -e "${YELLOW}🔐 Старый порт ${CURRENT_SSH_PORT} открыт временно.${NC}"
@@ -764,9 +943,6 @@ if confirm "Перезагрузить сервер сейчас? (рекоме�
     warn "Перезагрузка через 1 минуту. Отменить: shutdown -c"
     echo -e "${YELLOW}  Команда отмены: ${GREEN}shutdown -c${NC}"
     echo ""
-    # Даём пользователю минуту на отмену, если он ошибся.
-    # Мягкая перезагрузка корректно завершает все сервисы и уведомляет
-    # активных пользователей.
     shutdown -r +1 "Server hardening завершён. Плановая перезагрузка."
     echo -e "${GREEN}Сервер уйдёт на перезагрузку через 1 минуту.${NC}"
     echo -e "${GREEN}После перезагрузки подключение: ${NC}${YELLOW}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
@@ -778,8 +954,6 @@ echo ""
 
 # ============================================================
 # Корректное завершение логирования.
-# Закрываем pipe → tee получает EOF → wait дожидается завершения tee.
-# Без этого шага команда wait вызывала бы вечный deadlock.
 # ============================================================
 exec 1>&3 2>&1
 wait 2>/dev/null || true
