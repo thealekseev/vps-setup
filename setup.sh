@@ -117,8 +117,11 @@ run_timed() {
     _heartbeat "$desc" "$start" &
     hb_pid=$!
 
-    # Выполняем саму команду (её stdout/stderr идёт через tee).
-    "$@"
+    # Вывод команды идёт НАПРЯМУЮ в лог-файл, минуя tee.
+    # В терминале пользователь видит только спиннер и итоговую строку,
+    # а в /var/log/server-hardening.log сохраняется весь вывод команды.
+    # O_APPEND гарантирует, что строки tee и нашей команды не порвут друг друга.
+    "$@" >> "$LOG_FILE" 2>&1
     rc=$?
 
     # Останавливаем heartbeat.
@@ -131,7 +134,13 @@ run_timed() {
     fi
 
     end=$(date +%s)
-    echo -e "  ${GREEN}✓${NC} $desc — $((end - start)) сек."
+    if [ "$rc" -eq 0 ]; then
+        echo -e "  ${GREEN}✓${NC} $desc — $((end - start)) сек."
+    else
+        # Ненулевой код возврата — сообщаем пользователю, но не считаем это
+        # фатальной ошибкой: вызывающий код сам решает (|| true, if ! ...).
+        echo -e "  ${RED}✗${NC} $desc — $((end - start)) сек. (exit $rc)"
+    fi
     return "$rc"
 }
 
