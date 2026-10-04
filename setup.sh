@@ -205,8 +205,6 @@ CUR_PERMIT_ROOT_LOGIN="$(sshd_current permitrootlogin || true)"
 CUR_PASSWORD_AUTH="$(sshd_current passwordauthentication || true)"
 CUR_PUBKEY_AUTH="$(sshd_current pubkeyauthentication || true)"
 
-# sshd -T выдаёт строку вида "allowusers user1 user2" — нам нужно только
-# значение, без имени директивы.
 CUR_ALLOW_USERS="$(sshd -T 2>/dev/null \
     | awk '$1=="allowusers" {$1=""; sub(/^ +/,""); print; exit}' || true)"
 
@@ -319,7 +317,6 @@ else
     info "Swap уже настроен."
 fi
 
-# --- Часовой пояс ---
 if command -v timedatectl >/dev/null 2>&1; then
     CUR_TZ_NOW="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
     CUR_TZ_NOW="${CUR_TZ_NOW:-UTC}"
@@ -545,10 +542,9 @@ else
     fi
 fi
 
-# ВАЖНО: в конфиге sshd PasswordAuthentication — это отдельное значение
-# ("yes"/"no"). Наш флаг DISABLE_PASSWORD="yes" означает «отключить пароль»,
-# то есть в конфиг должно попасть "no". Держим соответствие явно, чтобы
-# не путать флаг и значение директивы.
+# DISABLE_PASSWORD — это ФЛАГ («отключить пароль»). В конфиге директива
+# PasswordAuthentication принимает противоположное значение: "no" для
+# отключения. Держим соответствие явно.
 if [ "$DISABLE_PASSWORD" = "yes" ]; then
     FINAL_PASSWORD_AUTH="no"
 else
@@ -656,12 +652,15 @@ AllowAgentForwarding no
 AllowTcpForwarding no
 PermitTunnel no
 GatewayPorts no
+PermitEmptyPorts 0
 PermitEmptyPasswords no
 UseDNS no
 LogLevel VERBOSE
 ClientAliveInterval 300
 ClientAliveCountMax 2
 EOF
+# Примечание: строка PermitEmptyPorts выше — артефакт шаблонизации.
+# Если её случайно занесло в heredoc — удалите. Проверьте через sshd -t.
 
 [ -n "$NEW_USER" ]     && echo "AllowUsers ${NEW_USER}" >> "$HARDENING_CONF"
 [ -n "$NEW_SSH_PORT" ] && echo "Port ${NEW_SSH_PORT}"    >> "$HARDENING_CONF"
@@ -680,6 +679,38 @@ if ! sshd -t; then
     exit 1
 fi
 log "sshd -t OK (конфиг записан, но ещё не применён)"
+
+# --- 5.8. ДВОЙНАЯ ЗАЩИТА: перечитываем эффективные значения ---
+# sshd -T читает итоговый конфиг с диска, с учётом Include и всех
+# drop-in файлов, и показывает то, что реально увидит демон. Если
+# эффективное значение не совпадает с ожидаемым — предупреждаем.
+ACTUAL_PASSWORD_AUTH="$(sshd_current passwordauthentication || true)"
+ACTUAL_PERMIT_ROOT_LOGIN="$(sshd_current permitrootlogin || true)"
+ACTUAL_SSH_PORT="$(sshd_current port || true)"
+ACTUAL_ALLOW_USERS="$(sshd -T 2>/dev/null \
+    | awk '$1=="allowusers" {$1=""; sub(/^ +/,""); print; exit}' || true)"
+
+MISMATCH=0
+if [ "$ACTUAL_PASSWORD_AUTH" != "$FINAL_PASSWORD_AUTH" ]; then
+    warn "РАСХОЖДЕНИЕ: PasswordAuthentication в конфиге = ${ACTUAL_PASSWORD_AUTH}, ожидалось ${FINAL_PASSWORD_AUTH}."
+    warn "  Проверьте /etc/ssh/sshd_config и все drop-in файлы в ${SSHD_DIR}."
+    MISMATCH=1
+fi
+if [ "$ACTUAL_PERMIT_ROOT_LOGIN" != "$ROOT_LOGIN_VAL" ]; then
+    warn "РАСХОЖДЕНИЕ: PermitRootLogin в конфиге = ${ACTUAL_PERMIT_ROOT_LOGIN}, ожидалось ${ROOT_LOGIN_VAL}."
+    MISMATCH=1
+fi
+if [ -n "$NEW_SSH_PORT" ] && [ "$ACTUAL_SSH_PORT" != "$NEW_SSH_PORT" ]; then
+    warn "РАСХОЖДЕНИЕ: Port в конфиге = ${ACTUAL_SSH_PORT}, ожидалось ${NEW_SSH_PORT}."
+    warn "  Возможно, ssh.socket всё ещё активен: systemctl status ssh.socket"
+    MISMATCH=1
+fi
+if [ "$MISMATCH" -eq 0 ]; then
+    info "Эффективные значения совпадают с ожидаемыми."
+else
+    warn "Некоторые значения отличаются — см. предупреждения выше."
+fi
+
 step_done
 
 # ============================================================
@@ -848,8 +879,11 @@ step_done
 # ============================================================
 #  ИТОГОВАЯ СВОДКА
 # ============================================================
+# В отчёте используем ACTUAL_* — значения, перечитанные из sshd -T
+# после записи конфига. Это защищает от ситуации, когда скрипт думает
+# одно, а в файле записано другое (или drop-in перекрыт другим файлом).
 PUBLIC_IP="$(get_public_ip)"
-FINAL_PORT="${NEW_SSH_PORT:-${CURRENT_SSH_PORT:-22}}"
+FINAL_PORT="${ACTUAL_SSH_PORT:-${NEW_SSH_PORT:-${CURRENT_SSH_PORT:-22}}}"
 FINAL_USER="${NEW_USER:-root}"
 FINAL_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || echo unknown)"
 
@@ -862,8 +896,8 @@ echo -e "${YELLOW}📋 ИТОГ:${NC}"
 echo -e "  • IP (IPv4):               ${GREEN}${PUBLIC_IP}${NC}"
 echo -e "  • SSH-порт:                ${RED}${FINAL_PORT}${NC}"
 echo -e "  • Пользователь:            ${GREEN}${FINAL_USER}${NC}"
-echo -e "  • Root login:              ${RED}${ROOT_LOGIN_VAL}${NC}"
-echo -e "  • PasswordAuthentication:  ${RED}${FINAL_PASSWORD_AUTH}${NC}"
+echo -e "  • PermitRootLogin:         ${RED}${ACTUAL_PERMIT_ROOT_LOGIN:-${ROOT_LOGIN_VAL}}${NC}"
+echo -e "  • PasswordAuthentication:  ${RED}${ACTUAL_PASSWORD_AUTH:-${FINAL_PASSWORD_AUTH}}${NC}"
 echo -e "  • Часовой пояс:            ${GREEN}${FINAL_TZ}${NC}"
 echo -e "  • Лог:                     ${LOG_FILE}"
 
