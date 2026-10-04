@@ -22,7 +22,7 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-### Вариант 2: Запуск одной командой (На ваш страх и риск)
+### Вариант 2: Запуск одной командой
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/thealekseev/vps-setup/refs/heads/main/setup.sh)
