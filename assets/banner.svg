@@ -59,7 +59,7 @@
   <rect x="0" y="0" width="6" height="300" fill="url(#accent)"/>
 
   <!-- ===== ЛОГОТИП + ПОДПИСЬ (отцентрированы по высоте) ===== -->
-  <image href="./logo.svg"
+  <image href="logo.svg"
          x="60" y="96" width="220" height="76"
          preserveAspectRatio="xMinYMid meet"/>
 
