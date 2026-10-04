@@ -24,9 +24,8 @@ exec 3>&1 4>&2
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # Определяем, есть ли у нас интерактивный терминал.
-# Если да — используем красивый спиннер в терминале.
-# Если нет (curl|bash в CI, перенаправление в файл) — используем
-# периодические сообщения в лог.
+# Если да — используем спиннер в терминале. Если нет (curl|bash в CI,
+# перенаправление в файл) — используем периодические сообщения в лог.
 SPINNER_ENABLED=0
 if [ -t 3 ]; then
     SPINNER_ENABLED=1
@@ -40,20 +39,19 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[x]${NC} $*"; }
 info() { echo -e "${BLUE}[i]${NC} $*"; }
 
-# Глобальный обработчик ошибок: выводит номер строки и инструкцию по восстановлению,
-# чтобы скрипт не завершался молча при непредвиденных сбоях.
+# Глобальный обработчик ошибок: выводит номер строки и инструкцию
+# по восстановлению, чтобы скрипт не завершался молча при сбоях.
 trap 'err "Непредвиденная ошибка в строке $LINENO. Лог: $LOG_FILE. Соединение НЕ перезапущено. Проверьте: sshd -t"' ERR
 
 # ---------- Управление шагами ----------
 STEP=0; TOTAL_STEPS=10; START_TIME=0
 
 step_start() {
-    # Используем арифметическое присваивание, чтобы избежать возврата exit code 1
-    # при STEP=0 (что в режиме set -e ложно спровоцировало бы срабатывание trap ERR).
+    # Арифметическое присваивание вместо ((STEP++)) — иначе при STEP=0
+    # возвращается exit code 1 и ложно срабатывает trap ERR.
     STEP=$((STEP + 1))
 
     # Прогресс-бар: 20 символов, заполнение пропорционально STEP.
-    # Рядом выводим процент выполнения — удобно оценивать оставшееся время.
     local width=20
     local filled=$(( STEP * width / TOTAL_STEPS ))
     local percent=$(( STEP * 100 / TOTAL_STEPS ))
@@ -69,15 +67,14 @@ step_start() {
 }
 
 # Heartbeat: фоновый индикатор жизни.
-#   * В терминале: вращающийся спиннер + счётчик секунд,
-#     перерисовка одной строки ~6 раз в секунду.
+#   * В терминале: вращающийся спиннер + счётчик секунд.
 #   * Без TTY:     периодическая запись в лог каждые 60 с.
 _heartbeat() {
     local desc="$1"
     local start="$2"
     local tick=0
     local now elapsed
-    # Кадры спиннера — символы Брайля, классика для CLI.
+    # Кадры спиннера — символы Брайля.
     local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
     local n=${#frames[@]}
 
@@ -85,8 +82,6 @@ _heartbeat() {
         if [ "$SPINNER_ENABLED" -eq 1 ]; then
             now=$(date +%s)
             elapsed=$((now - start))
-            # \r — в начало строки, \033[K — стереть до конца.
-            # Пишем в FD 3 (терминал), минуя tee → в лог не попадает.
             printf '\r\033[K  %b%s%b %s — %s сек.' \
                 "${CYAN}" "${frames[$((tick % n))]}" "${NC}" \
                 "$desc" "$elapsed" >&3 2>/dev/null || return 0
@@ -112,21 +107,16 @@ run_timed() {
     echo -e "  ${CYAN}↳${NC} $desc"
     start=$(date +%s)
 
-    # Запускаем heartbeat в фоне.
     _heartbeat "$desc" "$start" &
     hb_pid=$!
 
     # Вывод команды идёт НАПРЯМУЮ в лог-файл, минуя tee.
-    # В терминале пользователь видит только спиннер и итоговую строку,
-    # а в /var/log/server-hardening.log сохраняется весь вывод команды.
     "$@" >> "$LOG_FILE" 2>&1
     rc=$?
 
-    # Останавливаем heartbeat.
     kill "$hb_pid" 2>/dev/null
     wait "$hb_pid" 2>/dev/null || true
 
-    # В интерактивном режиме затираем строку спиннера.
     if [ "$SPINNER_ENABLED" -eq 1 ]; then
         printf '\r\033[K' >&3 2>/dev/null || true
     fi
@@ -135,8 +125,6 @@ run_timed() {
     if [ "$rc" -eq 0 ]; then
         echo -e "  ${GREEN}✓${NC} $desc — $((end - start)) сек."
     else
-        # Ненулевой код возврата — сообщаем пользователю, но не считаем это
-        # фатальной ошибкой: вызывающий код сам решает (|| true, if ! ...).
         echo -e "  ${RED}✗${NC} $desc — $((end - start)) сек. (exit $rc)"
     fi
     return "$rc"
@@ -151,9 +139,21 @@ step_done() {
 confirm() {
     local prompt="$1" answer
     # Чтение строго из /dev/tty гарантирует работу интерактивных запросов
-    # даже при запуске скрипта через конвейер (например, curl ... | sudo bash).
+    # даже при запуске скрипта через конвейер (curl ... | sudo bash).
     read -r -p "$(echo -e "${YELLOW}${prompt} [y/N]: ${NC}")" answer < /dev/tty
     [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+# pad_right «строка» «ширина»
+# Возвращает строку, добитую пробелами справа до нужной ШИРИНЫ В СИМВОЛАХ.
+# Стандартный printf "%-Ns" считает БАЙТЫ, поэтому кириллица в UTF-8
+# (2 байта на символ) ломает выравнивание. Здесь используем ${#var} —
+# в UTF-8 локали это именно количество символов.
+pad_right() {
+    local s="$1" width="$2"
+    local padding=$(( width - ${#s} ))
+    [ "$padding" -lt 0 ] && padding=0
+    printf '%s%*s' "$s" "$padding" ""
 }
 
 backup_file() {
@@ -177,11 +177,14 @@ validate_username() {
 }
 
 # Читает эффективное значение параметра из sshd_config.
-# Использует `sshd -T`, который учитывает Include и drop-in файлы.
-# Возвращает значение через stdout или пустоту, если параметр не найден.
+# `sshd -T` учитывает Include и drop-in файлы. Может вернуть non-zero
+# при warnings в конфиге — для нас это чисто информационный вызов.
 sshd_current() {
     local key="$1"
-    sshd -T 2>/dev/null | awk -v k="$key" 'tolower($1)==k {print $2; exit}'
+    local val=""
+    val="$(sshd -T 2>/dev/null | awk -v k="$key" 'tolower($1)==k {print $2; exit}' || true)"
+    printf '%s' "$val"
+    return 0
 }
 
 service_restart_or_reload_ssh() {
@@ -194,7 +197,6 @@ service_restart_or_reload_ssh() {
         err "Не найден сервис ssh/sshd"; return 1
     fi
 
-    # Проверяем синтаксис конфигурации перед любым действием с сервисом
     sshd -t || { err "sshd -t не проходит. Перезапуск отменён."; return 1; }
 
     if systemctl reload "$unit" 2>/dev/null; then
@@ -207,8 +209,6 @@ service_restart_or_reload_ssh() {
 }
 
 get_public_ip() {
-    # Принудительно запрашиваем IPv4 (-4), чтобы избежать выдачи IPv6-адреса,
-    # к которому у пользователя может не быть доступа через домашнего провайдера.
     curl -4 -fsS --max-time 5 https://ifconfig.me 2>/dev/null \
       || curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null \
       || echo "unknown"
@@ -245,25 +245,36 @@ done
 # Здесь мы ТОЛЬКО читаем текущее состояние и показываем его пользователю.
 # Ничего не меняется. Это нужно, чтобы пользователь заранее увидел,
 # из чего мы исходим, и что именно будет изменено в следующих шагах.
+#
+# ВАЖНО: все команды ниже — информационные. Любая из них может вернуть
+# non-zero (например, systemctl is-active для inactive-сервиса), и с
+# включённым `trap ERR` это вызвало бы ложное срабатывание. Поэтому
+# каждое присваивание защищено `|| true`, а значение по умолчанию
+# подставляется отдельно через ${VAR:-default}.
 step_start "Предварительный анализ системы"
 
 # --- Текущая конфигурация SSH (эффективная, с учётом include/drop-in) ---
-CUR_SSH_PORT="$(sshd_current port)";        CUR_SSH_PORT="${CUR_SSH_PORT:-22}"
-CUR_PERMIT_ROOT_LOGIN="$(sshd_current permitrootlogin)"
-CUR_PASSWORD_AUTH="$(sshd_current passwordauthentication)"
-CUR_PUBKEY_AUTH="$(sshd_current pubkeyauthentication)"
-CUR_ALLOW_USERS="$(sshd -T 2>/dev/null | awk '$1=="allowusers" {print $0}' | head -1)"
+CUR_SSH_PORT="$(sshd_current port || true)";  CUR_SSH_PORT="${CUR_SSH_PORT:-22}"
+CUR_PERMIT_ROOT_LOGIN="$(sshd_current permitrootlogin || true)"
+CUR_PASSWORD_AUTH="$(sshd_current passwordauthentication || true)"
+CUR_PUBKEY_AUTH="$(sshd_current pubkeyauthentication || true)"
+# awk с `exit` вместо `| head -1` — чтобы не ловить SIGPIPE+pipefail.
+CUR_ALLOW_USERS="$(sshd -T 2>/dev/null | awk '$1=="allowusers" {print $0; exit}' || true)"
 
 # --- Наличие SSH-ключей ---
 CUR_KEYS_ROOT="нет"
 [ -s /root/.ssh/authorized_keys ] && CUR_KEYS_ROOT="есть"
 
-CUR_KEYS_USERS=""
+# Массив пользователей с ключами (без подshell'а — используем массив).
+declare -a CUR_KEYED_USERS=()
+# nullglob: если ничего не найдено, паттерн не подставляется буквально.
+shopt -s nullglob
 for d in /home/*/.ssh/authorized_keys; do
     [ -s "$d" ] || continue
-    local_u="$(dirname "$(dirname "$d")" | xargs basename)"
-    CUR_KEYS_USERS="${CUR_KEYS_USERS}${local_u} (есть)\n"
+    local_u="$(basename "$(dirname "$(dirname "$d")")" || true)"
+    [ -n "$local_u" ] && CUR_KEYED_USERS+=("$local_u")
 done
+shopt -u nullglob
 
 # --- Socket-активация SSH ---
 CUR_SSH_SOCKET="нет"
@@ -275,49 +286,56 @@ else
 fi
 
 # --- UFW ---
-CUR_UFW_STATUS="$(ufw status 2>/dev/null | head -1 | awk '{print $2}')"
+# awk NR==1 без head — избегаем SIGPIPE+pipefail.
+CUR_UFW_STATUS="$(ufw status 2>/dev/null | awk 'NR==1 {print $2}' || true)"
 CUR_UFW_STATUS="${CUR_UFW_STATUS:-не установлен}"
 
 # --- Fail2ban ---
-CUR_F2B_STATUS="$(systemctl is-active fail2ban 2>/dev/null)"
+# `systemctl is-active` ВСЕГДА возвращает non-zero для inactive/failed.
+# Это не ошибка — просто состояние сервиса.
+CUR_F2B_STATUS="$(systemctl is-active fail2ban 2>/dev/null || true)"
 CUR_F2B_STATUS="${CUR_F2B_STATUS:-inactive}"
 
 # --- Swap / TZ ---
 CUR_SWAP="нет"
 swapon --show 2>/dev/null | grep -q . && CUR_SWAP="есть"
-CUR_TZ="$(timedatectl show -p Timezone --value 2>/dev/null)"
+CUR_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
 CUR_TZ="${CUR_TZ:-unknown}"
 
 # --- Печатаем сводку ---
+# Используем pad_right с шириной 26 символов — это правильно считает
+# кириллицу (в отличие от printf "%-26s", который считает байты).
+LABEL_WIDTH=26
+
 echo ""
 echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║             ТЕКУЩАЯ КОНФИГУРАЦИЯ СИСТЕМЫ                 ║${NC}"
 echo -e "${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  ${YELLOW}SSH:${NC}"
-printf "    %-28s %s\n" "Порт:"                     "${CUR_SSH_PORT}"
-printf "    %-28s %s\n" "PermitRootLogin:"         "${CUR_PERMIT_ROOT_LOGIN:-<не задан>}"
-printf "    %-28s %s\n" "PasswordAuthentication:"  "${CUR_PASSWORD_AUTH:-<не задан>}"
-printf "    %-28s %s\n" "PubkeyAuthentication:"    "${CUR_PUBKEY_AUTH:-<не задан>}"
-printf "    %-28s %s\n" "ssh.socket:"              "${CUR_SSH_SOCKET}"
+echo "    $(pad_right 'Порт:'                     $LABEL_WIDTH)${CUR_SSH_PORT}"
+echo "    $(pad_right 'PermitRootLogin:'          $LABEL_WIDTH)${CUR_PERMIT_ROOT_LOGIN:-<не задан>}"
+echo "    $(pad_right 'PasswordAuthentication:'   $LABEL_WIDTH)${CUR_PASSWORD_AUTH:-<не задан>}"
+echo "    $(pad_right 'PubkeyAuthentication:'     $LABEL_WIDTH)${CUR_PUBKEY_AUTH:-<не задан>}"
+echo "    $(pad_right 'ssh.socket:'               $LABEL_WIDTH)${CUR_SSH_SOCKET}"
 echo ""
 echo -e "  ${YELLOW}SSH-ключи:${NC}"
-printf "    %-28s %s\n" "root:"                    "${CUR_KEYS_ROOT}"
-if [ -n "$CUR_KEYS_USERS" ]; then
-    echo -e "$CUR_KEYS_USERS" | while IFS= read -r line; do
-        [ -n "$line" ] && printf "    %-28s %s\n" "$line"
+echo "    $(pad_right 'root:'                     $LABEL_WIDTH)${CUR_KEYS_ROOT}"
+if [ ${#CUR_KEYED_USERS[@]} -gt 0 ]; then
+    for u in "${CUR_KEYED_USERS[@]}"; do
+        echo "    $(pad_right "${u}:" $LABEL_WIDTH)есть"
     done
 else
-    printf "    %-28s %s\n" "в /home/*/.ssh:"        "нет"
+    echo "    $(pad_right 'в /home/*/.ssh:' $LABEL_WIDTH)нет"
 fi
 echo ""
 echo -e "  ${YELLOW}Firewall и защита:${NC}"
-printf "    %-28s %s\n" "UFW:"                     "${CUR_UFW_STATUS}"
-printf "    %-28s %s\n" "Fail2ban:"                "${CUR_F2B_STATUS}"
+echo "    $(pad_right 'UFW:'                      $LABEL_WIDTH)${CUR_UFW_STATUS}"
+echo "    $(pad_right 'Fail2ban:'                 $LABEL_WIDTH)${CUR_F2B_STATUS}"
 echo ""
 echo -e "  ${YELLOW}Прочее:${NC}"
-printf "    %-28s %s\n" "Swap:"                    "${CUR_SWAP}"
-printf "    %-28s %s\n" "Временная зона:"          "${CUR_TZ}"
+echo "    $(pad_right 'Swap:'                     $LABEL_WIDTH)${CUR_SWAP}"
+echo "    $(pad_right 'Временная зона:'           $LABEL_WIDTH)${CUR_TZ}"
 echo ""
 
 step_done
@@ -356,7 +374,7 @@ step_done
 #  4. Swap и время
 # ============================================================
 step_start "Swap и время"
-# Портативная проверка наличия активного swap (работает на всех версиях util-linux)
+# Портативная проверка наличия активного swap.
 if ! swapon --show 2>/dev/null | grep -q .; then
     warn "Swap не найден. Создаём файл подкачки 2GB..."
     fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048
@@ -375,7 +393,7 @@ step_done
 # ============================================================
 #  5. SSH hardening — планирование и применение
 # ============================================================
-# Здесь мы сначала собираем все решения пользователя, ничего не меняя.
+# Здесь мы сначала собираем все решения, ничего не меняя.
 # Затем показываем итоговый план «текущее → планируемое» и запрашиваем
 # явное подтверждение. Только после этого пишем конфиг и применяем.
 step_start "SSH hardening"
@@ -440,7 +458,14 @@ done
 
 DISABLE_PASSWORD="no"
 if [ "$HAS_KEYS" -eq 1 ]; then
-    confirm "Найдены существующие SSH-ключи. Отключить вход по паролю?" && DISABLE_PASSWORD="yes"
+    # Ключи найдены → согласно политике скрипта отключаем вход по паролю.
+    # Не спрашиваем подтверждения: наличие рабочих ключей — достаточный
+    # сигнал. Пользователь ещё увидит это изменение в ПЛАНЕ ИЗМЕНЕНИЙ SSH
+    # ниже и сможет отклонить весь план целиком, если не согласен.
+    DISABLE_PASSWORD="yes"
+    info "Найдены SSH-ключи → PasswordAuthentication будет отключён."
+    warn "Проверьте ДО применения, что вход по ключу работает:"
+    warn "  ssh -i /путь/к/ключу <user>@<этот-IP>"
 else
     warn "SSH-ключи не найдены!"
     if confirm "Сгенерировать новый ed25519-ключ?"; then
@@ -532,39 +557,36 @@ echo -e "${BLUE}║            ПЛАН ИЗМЕНЕНИЙ SSH                  
 echo -e "${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# Определяем финальный порт для отображения
 FINAL_PORT_PREVIEW="${NEW_SSH_PORT:-${CUR_SSH_PORT}}"
 
-printf "  %-26s %s\n" "Параметр" "Было → Станет"
+echo "  $(pad_right 'Параметр' 24)Было → Станет"
 echo "  ────────────────────────────────────────────────────────"
 
 # Порт
 if [ "$CUR_SSH_PORT" = "$FINAL_PORT_PREVIEW" ]; then
-    printf "  %-26s %s\n" "SSH-порт" "${CUR_SSH_PORT} (без изменений)"
+    echo "  $(pad_right 'SSH-порт' 24)${CUR_SSH_PORT} (без изменений)"
 else
-    printf "  %-26s %s → %s\n" "SSH-порт" "${CUR_SSH_PORT}" "${FINAL_PORT_PREVIEW}"
+    echo "  $(pad_right 'SSH-порт' 24)${CUR_SSH_PORT} → ${FINAL_PORT_PREVIEW}"
 fi
 
 # PermitRootLogin
 if [ "$CUR_PERMIT_ROOT_LOGIN" = "$ROOT_LOGIN_VAL" ]; then
-    printf "  %-26s %s (без изменений)\n" "PermitRootLogin" "${ROOT_LOGIN_VAL}"
+    echo "  $(pad_right 'PermitRootLogin' 24)${ROOT_LOGIN_VAL} (без изменений)"
 else
-    printf "  %-26s %s → %s\n" "PermitRootLogin" \
-        "${CUR_PERMIT_ROOT_LOGIN:-?}" "${ROOT_LOGIN_VAL}"
+    echo "  $(pad_right 'PermitRootLogin' 24)${CUR_PERMIT_ROOT_LOGIN:-?} → ${ROOT_LOGIN_VAL}"
 fi
 
 # PasswordAuthentication — ключевой пункт
 if [ "$CUR_PASSWORD_AUTH" = "$DISABLE_PASSWORD" ]; then
-    printf "  %-26s %s (без изменений)\n" "PasswordAuthentication" "${DISABLE_PASSWORD}"
+    echo "  $(pad_right 'PasswordAuthentication' 24)${DISABLE_PASSWORD} (без изменений)"
 else
-    printf "  %-26s %s → %s\n" "PasswordAuthentication" \
-        "${CUR_PASSWORD_AUTH:-?}" "${DISABLE_PASSWORD}"
+    echo "  $(pad_right 'PasswordAuthentication' 24)${CUR_PASSWORD_AUTH:-?} → ${DISABLE_PASSWORD}"
 fi
 
 # AllowUsers
 if [ -n "$NEW_USER" ]; then
     CUR_ALLOW="${CUR_ALLOW_USERS:-<все>}"
-    printf "  %-26s %s → %s\n" "AllowUsers" "${CUR_ALLOW}" "${NEW_USER}"
+    echo "  $(pad_right 'AllowUsers' 24)${CUR_ALLOW} → ${NEW_USER}"
 fi
 
 echo "  ────────────────────────────────────────────────────────"
@@ -588,13 +610,6 @@ echo ""
 if ! confirm "Применить эти изменения SSH?"; then
     warn "Применение изменений SSH отменено пользователем."
     warn "Конфиг sshd НЕ изменён. Сервис не перезапущен."
-    # Откатываем создание нового пользователя? Нет — пользователь может быть
-    # уже существующим, а его создание безопасно. Оставляем.
-    NEW_SSH_PORT=""
-    DISABLE_PASSWORD="no"
-    ROOT_LOGIN_VAL="prohibit-password"
-    # Отменяем дальнейшее выполнение скрипта — без SSH-плана остальное
-    # не имеет смысла.
     echo ""
     warn "Скрипт завершён по запросу пользователя (SSH-план отклонён)."
     exec 1>&3 2>&1
@@ -654,7 +669,6 @@ fi
 # Права доступа:
 # sshd_config — 644 (стандарт дистрибутива, ожидается инструментами аудита)
 # 99-hardening.conf — 600 (drop-in с эффективной политикой, CIS §5.2.1)
-# Явно фиксируем владельца root:root, так как chmod владельца не устанавливает.
 chown root:root "$SSHD_CONFIG" "$HARDENING_CONF"
 chmod 644 "$SSHD_CONFIG"
 chmod 600 "$HARDENING_CONF"
@@ -693,14 +707,16 @@ if [ -n "${SSH_CONNECTION:-}" ]; then
     CURRENT_SSH_PORT=$(echo "$SSH_CONNECTION" | awk '{print $4}')
 fi
 
-# Совместимый fallback: разбираем established-соединения через ss,
-# избегая фильтров sport=:22, которые работают неверно на некоторых версиях.
+# Совместимый fallback: разбираем established-соединения через ss.
+# grep возвращает 1, если нет established-соединений, а head может
+# закрыть pipe раньше времени → с pipefail весь конвейер вернёт
+# non-zero. `|| true` защищает от ложного срабатывания ERR trap.
 if [ -z "$CURRENT_SSH_PORT" ]; then
     CURRENT_SSH_PORT=$(ss -tn state established 2>/dev/null \
         | awk '{print $4}' \
         | grep -E ':[0-9]+$' \
         | head -n 1 \
-        | cut -d: -f2)
+        | cut -d: -f2) || true
 fi
 CURRENT_SSH_PORT="${CURRENT_SSH_PORT:-22}"
 log "Текущий SSH-порт сессии: ${CURRENT_SSH_PORT}"
@@ -850,31 +866,30 @@ echo -e "${GREEN}           НАСТРОЙКА СЕРВЕРА ЗАВЕРШЕНА
 echo -e "${GREEN}============================================================${NC}"
 echo ""
 echo -e "${YELLOW}📋 ИТОГ:${NC}"
-echo -e "  • IP (IPv4):               ${GREEN}${PUBLIC_IP}${NC}"
-echo -e "  • SSH-порт:                ${RED}${FINAL_PORT}${NC}"
-echo -e "  • Пользователь:            ${GREEN}${FINAL_USER}${NC}"
-echo -e "  • Root login:              ${RED}${ROOT_LOGIN_VAL}${NC}"
-echo -e "  • Password auth:           ${RED}${DISABLE_PASSWORD}${NC}"
-echo -e "  • Лог:                     ${LOG_FILE}"
+echo "  • IP (IPv4):               ${GREEN}${PUBLIC_IP}${NC}"
+echo "  • SSH-порт:                ${RED}${FINAL_PORT}${NC}"
+echo "  • Пользователь:            ${GREEN}${FINAL_USER}${NC}"
+echo "  • Root login:              ${RED}${ROOT_LOGIN_VAL}${NC}"
+echo "  • Password auth:           ${RED}${DISABLE_PASSWORD}${NC}"
+echo "  • Лог:                     ${LOG_FILE}"
 
 [ -f /root/GENERATED_PRIVATE_KEY.txt ] && \
-    echo -e "  • Приватный ключ:          ${RED}/root/GENERATED_PRIVATE_KEY.txt${NC}"
+    echo "  • Приватный ключ:          ${RED}/root/GENERATED_PRIVATE_KEY.txt${NC}"
 [ -n "$NEW_SSH_PORT" ] && \
-    echo -e "  • Порт сохранён в:         /root/.new_ssh_port"
+    echo "  • Порт сохранён в:         /root/.new_ssh_port"
 if [ -n "$NEW_USER" ] && [ -f "/etc/sudoers.d/90-${NEW_USER}" ]; then
-    echo -e "  • Sudo для ${NEW_USER}:     ${YELLOW}NOPASSWD${NC} (см. /etc/sudoers.d/90-${NEW_USER})"
+    echo "  • Sudo для ${NEW_USER}:     ${YELLOW}NOPASSWD${NC} (см. /etc/sudoers.d/90-${NEW_USER})"
 fi
 
-# Итоговое время выполнения
 SCRIPT_END=$(date +%s)
 TOTAL_ELAPSED=$((SCRIPT_END - SCRIPT_START))
 TOTAL_MIN=$((TOTAL_ELAPSED / 60))
 TOTAL_SEC=$((TOTAL_ELAPSED % 60))
-echo -e "  • Общее время выполнения:  ${GREEN}${TOTAL_MIN} мин ${TOTAL_SEC} сек${NC}"
+echo "  • Общее время выполнения:  ${GREEN}${TOTAL_MIN} мин ${TOTAL_SEC} сек${NC}"
 
 echo ""
 echo -e "${YELLOW}🔗 Подключение:${NC}"
-echo -e "  ${GREEN}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
+echo "  ${GREEN}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
 echo ""
 echo -e "${YELLOW}📋 UFW будет применён:${NC}"
 ufw status verbose
@@ -915,7 +930,7 @@ if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
     if confirm "Проверили вход через новый порт ${FINAL_PORT}?"; then
         ufw delete limit "${CURRENT_SSH_PORT}"/tcp >/dev/null 2>&1
         log "Старый порт ${CURRENT_SSH_PORT} закрыт."
-        echo -e "${GREEN}✅ Доступен только ${FINAL_PORT}.${NC}"
+        echo "✅ Доступен только ${FINAL_PORT}."
     else
         warn "Закрыть позже: ufw delete limit ${CURRENT_SSH_PORT}/tcp"
     fi
@@ -928,27 +943,24 @@ echo -e "${GREEN}============================================================${N
 
 if [ -f /root/GENERATED_PRIVATE_KEY.txt ]; then
     echo -e "${YELLOW}⚠️  Удалите приватный ключ:${NC}"
-    echo -e "   ${RED}rm -f /root/GENERATED_PRIVATE_KEY.txt${NC}"
+    echo "   ${RED}rm -f /root/GENERATED_PRIVATE_KEY.txt${NC}"
 fi
 echo -e "${GREEN}Спасибо!${NC}"
 
 # ============================================================
 #  Опциональная перезагрузка сервера.
-#  Спрашиваем отдельно от «применить UFW и перезапустить SSH»,
-#  чтобы пользователь мог сначала проверить вход по SSH в новой
-#  сессии и только потом инициировать reboot.
 # ============================================================
 echo ""
 if confirm "Перезагрузить сервер сейчас? (рекомендуется для применения всех изменений)"; then
     warn "Перезагрузка через 1 минуту. Отменить: shutdown -c"
-    echo -e "${YELLOW}  Команда отмены: ${GREEN}shutdown -c${NC}"
+    echo "  Команда отмены: ${GREEN}shutdown -c${NC}"
     echo ""
     shutdown -r +1 "Server hardening завершён. Плановая перезагрузка."
-    echo -e "${GREEN}Сервер уйдёт на перезагрузку через 1 минуту.${NC}"
-    echo -e "${GREEN}После перезагрузки подключение: ${NC}${YELLOW}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
+    echo "Сервер уйдёт на перезагрузку через 1 минуту."
+    echo "После перезагрузки подключение: ${YELLOW}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
 else
     warn "Перезагрузка отложена. Рекомендуется выполнить вручную:"
-    echo -e "  ${GREEN}sudo reboot${NC}"
+    echo "  ${GREEN}sudo reboot${NC}"
 fi
 echo ""
 
