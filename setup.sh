@@ -1,16 +1,16 @@
 #!/bin/bash
 
 # ============================================================
-#  Скрипт базовой настройки и hardening Linux-сервера (v2.4)
+#  Скрипт базовой настройки и hardening Linux-сервера (v2.5)
 #  Поддержка: Ubuntu 20.04/22.04/24.04, Debian 11/12
 #  Запуск от имени root
 #
 #  Репозиторий: https://github.com/thealekseev/vps-setup
 #
-#  Изменения в v2.4:
-#   - Полная автоматизация закрытия старого SSH-порта
-#   - Интерактивное подтверждение проверки нового подключения
-#   - Пользователю не нужно выполнять ручные команды
+#  Изменения в v2.5:
+#   - UFW больше НЕ включается в шаге 5 (правила только готовятся)
+#   - Итоговая сводка + подтверждение → только ПОТОМ enable UFW
+#   - Это защищает текущую SSH-сессию от обрыва на rkhunter --update
 # ============================================================
 
 set -uo pipefail
@@ -209,7 +209,6 @@ if confirm "Создать non-root пользователя с правами s
         break
     done
 
-    # Перенос authorized_keys от root, если они уже есть
     if [ -s /root/.ssh/authorized_keys ] && \
        [ ! -s "/home/${NEW_USER}/.ssh/authorized_keys" ]; then
         install -d -m 700 -o "$NEW_USER" -g "$NEW_USER" "/home/${NEW_USER}/.ssh"
@@ -243,7 +242,6 @@ else
         cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
         chmod 600 /root/.ssh/authorized_keys
 
-        # Безопасное сохранение приватного ключа (НЕ выводим в лог!)
         KEY_FILE="/root/GENERATED_PRIVATE_KEY.txt"
         cp /root/.ssh/id_ed25519 "$KEY_FILE"
         chmod 400 "$KEY_FILE"
@@ -258,7 +256,6 @@ else
 
         if confirm "Вы скопировали приватный ключ и готовы отключить вход по паролю?"; then
             DISABLE_PASSWORD="yes"
-            # Если создан новый пользователь, копируем ключ и ему
             if [ -n "$NEW_USER" ] && [ ! -s "/home/${NEW_USER}/.ssh/authorized_keys" ]; then
                 install -d -m 700 -o "$NEW_USER" -g "$NEW_USER" "/home/${NEW_USER}/.ssh"
                 install -m 600 -o "$NEW_USER" -g "$NEW_USER" \
@@ -339,7 +336,6 @@ fi
 chmod 600 "$SSHD_CONFIG"
 chmod 600 "$HARDENING_CONF"
 
-# --- 4.5. Проверяем конфиг ---
 if ! sshd -t; then
     err "Ошибка в конфиге SSH. Откатываем hardening-конфиг."
     rm -f "$HARDENING_CONF"
@@ -348,18 +344,19 @@ fi
 log "Конфигурация SSH прошла проверку (sshd -t)"
 
 # ============================================================
-#  5. UFW Firewall (С ЗАЩИТОЙ ТЕКУЩЕЙ СЕССИИ)
+#  5. UFW Firewall (ПРАВИЛА ГОТОВИМ, НО НЕ ВКЛЮЧАЕМ!)  # ИЗМЕНЕНО (v2.5)
 # ============================================================
-log "[5/9] Настройка UFW..."
+log "[5/9] Подготовка правил UFW (включение — в самом конце)..."
 
 sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw || echo 'IPV6=yes' >> /etc/default/ufw
 
-ufw --force reset >/dev/null
+# Сбрасываем предыдущие правила. Пока UFW выключен — сессия не оборвётся.
+ufw --force reset >/dev/null 2>&1 || true
 ufw default deny incoming
 ufw default allow outgoing
 ufw default deny routed
 
-# --- ВАЖНО: Определяем порт ТЕКУЩЕЙ SSH-сессии ---
+# --- Определяем порт ТЕКУЩЕЙ SSH-сессии ---
 CURRENT_SSH_PORT=""
 if [ -n "${SSH_CONNECTION:-}" ]; then
     CURRENT_SSH_PORT=$(echo "$SSH_CONNECTION" | awk '{print $4}')
@@ -371,11 +368,12 @@ if [ -z "$CURRENT_SSH_PORT" ]; then
 fi
 
 CURRENT_SSH_PORT="${CURRENT_SSH_PORT:-22}"
+log "Текущий SSH-порт сессии: ${CURRENT_SSH_PORT}"
 
 # --- Открываем порт текущей сессии (чтобы не потерять доступ) ---
 if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
     ufw limit "${CURRENT_SSH_PORT}"/tcp comment 'SSH OLD (temporary)'
-    warn "Открыт старый SSH-порт ${CURRENT_SSH_PORT} для сохранения текущей сессии."
+    warn "Добавлено правило: старый SSH-порт ${CURRENT_SSH_PORT} (временно)."
 fi
 
 # --- Открываем новый (или текущий) SSH-порт ---
@@ -389,22 +387,7 @@ ufw allow 80/tcp  comment 'HTTP'
 ufw allow 443/tcp comment 'HTTPS'
 ufw allow 443/udp comment 'QUIC/Hysteria2'
 
-# Показываем правила ДО включения и запрашиваем подтверждение
-echo ""
-echo -e "${YELLOW}============================================================${NC}"
-echo -e "${YELLOW}📋 ПРАВИЛА FIREWALL (UFW), КОТОРЫЕ БУДУТ ПРИМЕНЕНЫ:${NC}"
-echo -e "${YELLOW}============================================================${NC}"
-ufw status verbose
-echo -e "${YELLOW}============================================================${NC}"
-echo ""
-
-if confirm "Применить эти правила файерволла?"; then
-    ufw --force enable
-    log "UFW успешно включён."
-else
-    warn "Применение правил UFW отменено пользователем."
-    warn "Файервол остаётся выключенным. Включите позже: ufw enable"
-fi
+info "Правила UFW подготовлены. Включение произойдёт в самом конце скрипта."
 
 # ============================================================
 #  6. Fail2Ban
@@ -516,13 +499,12 @@ rkhunter --propupd >/dev/null 2>&1 || true
 log "База rkhunter обновлена."
 
 # ============================================================
-#  ИТОГОВАЯ СВОДКА (ПЕРЕД ПЕРЕЗАПУСКОМ SSH!)
+#  ИТОГОВАЯ СВОДКА (ПЕРЕД ВКЛЮЧЕНИЕМ UFW И ПЕРЕЗАПУСКОМ SSH!)  # ИЗМЕНЕНО (v2.5)
 # ============================================================
 PUBLIC_IP="$(get_public_ip)"
 FINAL_PORT="${NEW_SSH_PORT:-22}"
 FINAL_USER="${NEW_USER:-root}"
 
-# Ожидаем завершения фоновых процессов tee
 wait
 
 echo ""
@@ -545,27 +527,40 @@ if [ -n "$NEW_SSH_PORT" ]; then
 fi
 echo ""
 echo -e "${YELLOW}🔗 КОМАНДА ДЛЯ ПОДКЛЮЧЕНИЯ (скопируйте!):${NC}"
-if [ -n "$NEW_USER" ]; then
-    echo -e "  ${GREEN}ssh -p ${FINAL_PORT} ${NEW_USER}@${PUBLIC_IP}${NC}"
-else
-    echo -e "  ${GREEN}ssh -p ${FINAL_PORT} root@${PUBLIC_IP}${NC}"
+echo -e "  ${GREEN}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
+echo ""
+
+# --- Показываем будущие правила UFW и запрашиваем подтверждение ---  # ИЗМЕНЕНО (v2.5)
+echo -e "${YELLOW}============================================================${NC}"
+echo -e "${YELLOW}📋 ПРАВИЛА FIREWALL (UFW), КОТОРЫЕ СЕЙЧАС БУДУТ ПРИМЕНЕНЫ:${NC}"
+echo -e "${YELLOW}============================================================${NC}"
+ufw status verbose
+echo -e "${YELLOW}============================================================${NC}"
+echo ""
+
+if ! confirm "Применить правила UFW и перезапустить SSH?"; then
+    warn "Применение правил UFW отменено пользователем."
+    warn "Файервол остаётся выключенным. Включите позже: ufw enable"
+    warn "Перезапуск SSH также отменён. Применить настройки: systemctl reload ssh"
+    exit 0
 fi
+
+# ============================================================
+#  10. ВКЛЮЧЕНИЕ UFW (теперь безопасно — правила уже готовы)  # ИЗМЕНЕНО (v2.5)
+# ============================================================
+log "Применение правил UFW..."
+ufw --force enable
+log "UFW успешно включён."
+
 echo ""
 echo -e "${RED}============================================================${NC}"
 echo -e "${RED}⚠️  ВНИМАНИЕ! СЕЙЧАС ПРОИЗОЙДЁТ ПЕРЕЗАПУСК SSH              ${NC}"
 echo -e "${RED}============================================================${NC}"
-echo -e "${RED}• СКОПИРУЙТЕ команду для подключения ВЫШЕ!                  ${NC}"
 echo -e "${RED}• Откройте НОВОЕ окно терминала и проверьте вход.           ${NC}"
 echo -e "${RED}• Только ПОСЛЕ успешной проверки закрывайте эту сессию.     ${NC}"
 echo -e "${RED}• Если потеряли доступ — используйте VNC-консоль хостинга.  ${NC}"
 echo -e "${RED}============================================================${NC}"
 echo ""
-
-if ! confirm "Вы готовы к перезапуску SSH?"; then
-    warn "Перезапуск SSH отменён пользователем."
-    warn "Чтобы применить настройки позже, выполните: systemctl reload ssh"
-    exit 0
-fi
 
 # Перезапуск SSH — ПОСЛЕДНИМ шагом
 service_restart_or_reload_ssh
@@ -585,7 +580,7 @@ if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
     echo -e "${YELLOW}Старый порт ${CURRENT_SSH_PORT} временно открыт для сохранения текущей сессии.${NC}"
     echo -e "${YELLOW}После подтверждения он будет автоматически закрыт.${NC}"
     echo ""
-    
+
     if confirm "Вы успешно проверили подключение через новый порт ${FINAL_PORT}?"; then
         log "Закрываем старый SSH-порт ${CURRENT_SSH_PORT}..."
         ufw delete limit "${CURRENT_SSH_PORT}"/tcp >/dev/null 2>&1
@@ -605,11 +600,7 @@ echo -e "${GREEN}============================================================${N
 echo ""
 echo -e "${GREEN}✅ Сервер настроен и защищён.${NC}"
 echo -e "${GREEN}   Используйте команду для подключения:${NC}"
-if [ -n "$NEW_USER" ]; then
-    echo -e "   ${GREEN}ssh -p ${FINAL_PORT} ${NEW_USER}@${PUBLIC_IP}${NC}"
-else
-    echo -e "   ${GREEN}ssh -p ${FINAL_PORT} root@${PUBLIC_IP}${NC}"
-fi
+echo -e "   ${GREEN}ssh -p ${FINAL_PORT} ${FINAL_USER}@${PUBLIC_IP}${NC}"
 echo ""
 if [ -f "/root/GENERATED_PRIVATE_KEY.txt" ]; then
     echo -e "${YELLOW}⚠️  Не забудьте удалить файл с приватным ключом:${NC}"
