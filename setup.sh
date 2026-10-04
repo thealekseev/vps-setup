@@ -417,8 +417,21 @@ step_start "SSH hardening"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_DIR="/etc/ssh/sshd_config.d"
 mkdir -p "$SSHD_DIR"
-HARDENING_CONF="${SSHD_DIR}/99-hardening.conf"
+
+# Префикс 00 — сортируется раньше 50-cloud-init.conf и любых других
+# drop-in. В OpenSSH для одноимённых директив действует правило
+# «первое значение побеждает», поэтому наш файл должен грузиться первым.
+HARDENING_CONF="${SSHD_DIR}/00-hardening.conf"
 backup_file "$SSHD_CONFIG"
+
+# Подчищаем старые версии нашего конфига от предыдущих запусков.
+# Если оставить 99-hardening.conf рядом с 00-hardening.conf, значения
+# могут конфликтовать (первое побеждает — наш 00 будет выигрывать, но
+# лучше не оставлять мусор).
+if [ -f "${SSHD_DIR}/99-hardening.conf" ] && [ "$HARDENING_CONF" != "${SSHD_DIR}/99-hardening.conf" ]; then
+    warn "Найден устаревший ${SSHD_DIR}/99-hardening.conf — удаляем."
+    rm -f "${SSHD_DIR}/99-hardening.conf"
+fi
 
 # --- 5.1. Создание non-root пользователя ---
 NEW_USER=""
@@ -633,6 +646,32 @@ if [ -n "$NEW_SSH_PORT" ]; then
     chmod 600 /root/.new_ssh_port
 fi
 
+# --- Защита от перекрытия чужими drop-in ---
+# cloud-init и некоторые дистрибутивы кладут файлы вида 50-cloud-init.conf
+# с раскомментированными директивами. Так как в OpenSSH первое значение
+# побеждает, эти файлы могут полностью обнулить наши настройки.
+# Комментируем конфликтующие директивы во всех drop-in, кроме нашего,
+# и в основном sshd_config.
+CONFLICT_KEYS='^(PasswordAuthentication|PermitRootLogin|PubkeyAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|AllowUsers|AllowGroups|Port)[[:space:]]'
+
+shopt -s nullglob
+for f in "${SSHD_DIR}"/*.conf; do
+    [ "$f" = "$HARDENING_CONF" ] && continue
+    if grep -Eq "$CONFLICT_KEYS" "$f"; then
+        backup_file "$f"
+        sed -i -E "s|${CONFLICT_KEYS}|# [hardening] &|" "$f"
+        info "Закомментированы конфликтующие директивы в ${f}"
+    fi
+done
+shopt -u nullglob
+
+if grep -Eq "$CONFLICT_KEYS" "$SSHD_CONFIG"; then
+    backup_file "$SSHD_CONFIG"
+    sed -i -E "s|${CONFLICT_KEYS}|# [hardening] &|" "$SSHD_CONFIG"
+    info "Закомментированы конфликтующие директивы в ${SSHD_CONFIG}"
+fi
+
+# --- Пишем наш конфиг ---
 cat > "$HARDENING_CONF" <<EOF
 # Сгенерировано hardening-скриптом $(date -Iseconds)
 
@@ -688,16 +727,24 @@ ACTUAL_ALLOW_USERS="$(sshd -T 2>/dev/null \
 
 MISMATCH=0
 if [ "$ACTUAL_PASSWORD_AUTH" != "$FINAL_PASSWORD_AUTH" ]; then
-    warn "РАСХОЖДЕНИЕ: PasswordAuthentication в конфиге = ${ACTUAL_PASSWORD_AUTH}, ожидалось ${FINAL_PASSWORD_AUTH}."
-    warn "  Проверьте /etc/ssh/sshd_config и все drop-in файлы в ${SSHD_DIR}."
+    warn "РАСХОЖДЕНИЕ: PasswordAuthentication = ${ACTUAL_PASSWORD_AUTH}, ожидалось ${FINAL_PASSWORD_AUTH}."
+    warn "  Источники директивы (первое значение побеждает):"
+    grep -rns --include='*.conf' --include='sshd_config' \
+        '^[[:space:]]*PasswordAuthentication' \
+        "$SSHD_CONFIG" "$SSHD_DIR" 2>/dev/null \
+        | sed 's/^/    /' >&2 || true
     MISMATCH=1
 fi
 if [ "$ACTUAL_PERMIT_ROOT_LOGIN" != "$ROOT_LOGIN_VAL" ]; then
-    warn "РАСХОЖДЕНИЕ: PermitRootLogin в конфиге = ${ACTUAL_PERMIT_ROOT_LOGIN}, ожидалось ${ROOT_LOGIN_VAL}."
+    warn "РАСХОЖДЕНИЕ: PermitRootLogin = ${ACTUAL_PERMIT_ROOT_LOGIN}, ожидалось ${ROOT_LOGIN_VAL}."
+    grep -rns --include='*.conf' --include='sshd_config' \
+        '^[[:space:]]*PermitRootLogin' \
+        "$SSHD_CONFIG" "$SSHD_DIR" 2>/dev/null \
+        | sed 's/^/    /' >&2 || true
     MISMATCH=1
 fi
 if [ -n "$NEW_SSH_PORT" ] && [ "$ACTUAL_SSH_PORT" != "$NEW_SSH_PORT" ]; then
-    warn "РАСХОЖДЕНИЕ: Port в конфиге = ${ACTUAL_SSH_PORT}, ожидалось ${NEW_SSH_PORT}."
+    warn "РАСХОЖДЕНИЕ: Port = ${ACTUAL_SSH_PORT}, ожидалось ${NEW_SSH_PORT}."
     warn "  Возможно, ssh.socket всё ещё активен: systemctl status ssh.socket"
     MISMATCH=1
 fi
