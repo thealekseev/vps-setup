@@ -67,30 +67,38 @@ step_start() {
 }
 
 # Heartbeat: фоновый индикатор жизни.
-#   * В терминале: перерисовывает одну строку каждые 10 с.
-#   * Без TTY:     пишет полную строку в лог каждые 60 с.
+#   * В терминале: вращающийся спиннер + счётчик секунд,
+#     перерисовка одной строки ~6 раз в секунду.
+#   * Без TTY:     периодическая запись в лог каждые 60 с.
 _heartbeat() {
     local desc="$1"
     local start="$2"
     local tick=0
     local now elapsed
+    # Кадры спиннера — символы Брайля, классика для CLI.
+    # Если терминал не в UTF-8, легко заменить на: | / - \
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local n=${#frames[@]}
 
     while :; do
-        sleep 10
-        tick=$((tick + 1))
-        now=$(date +%s)
-        elapsed=$((now - start))
-
         if [ "$SPINNER_ENABLED" -eq 1 ]; then
-            # Живой спиннер в терминале (в обход tee → в лог не попадает).
-            printf '\r\033[K  %b⏳%b %s — %s сек.' \
-                "${YELLOW}" "${NC}" "$desc" "$elapsed" >&3 2>/dev/null || return 0
+            now=$(date +%s)
+            elapsed=$((now - start))
+            # \r — в начало строки, \033[K — стереть до конца.
+            # Пишем в FD 3 (терминал), минуя tee → в лог не попадает.
+            printf '\r\033[K  %b%s%b %s — %s сек.' \
+                "${CYAN}" "${frames[$((tick % n))]}" "${NC}" \
+                "$desc" "$elapsed" >&3 2>/dev/null || return 0
+            tick=$((tick + 1))
+            sleep 0.15
         else
-            # Без TTY: раз в 60 сек (6 тиков) пишем строку в лог,
-            # чтобы `tail -f` показывал, что процесс жив.
+            sleep 10
+            tick=$((tick + 1))
+            now=$(date +%s)
+            elapsed=$((now - start))
             if [ $((tick % 6)) -eq 0 ]; then
-                printf '  %b…%b %s — всё ещё выполняется (%s сек.)\n' \
-                    "${YELLOW}" "${NC}" "$desc" "$elapsed"
+                printf '  … %s — всё ещё выполняется (%s сек.)\n' \
+                    "$desc" "$elapsed"
             fi
         fi
     done
