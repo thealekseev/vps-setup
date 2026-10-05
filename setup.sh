@@ -173,6 +173,11 @@ sshd_current() {
     return 0
 }
 
+# Перезапускает или перезагружает SSH. Гарантирует, что:
+#   • ssh.socket погашен (иначе Port в sshd_config игнорируется);
+#   • выполнен именно restart, а не reload (reload не переустанавливает
+#     listening-сокеты при смене Port);
+#   • процесс sshd действительно поднялся.
 service_restart_or_reload_ssh() {
     local unit
     if systemctl list-unit-files | grep -q '^ssh\.service'; then
@@ -182,12 +187,34 @@ service_restart_or_reload_ssh() {
     else
         err "Не найден сервис ssh/sshd"; return 1
     fi
-    sshd -t || { err "sshd -t не проходит. Перезапуск отменён."; return 1; }
-    if systemctl reload "$unit" 2>/dev/null; then
-        log "SSH перезагружен (reload, $unit)"; return 0
+
+    # Если активен ssh.socket — reload бессмысленен: сокет продолжит
+    # слушать старый порт, а Port из sshd_config будет игнорироваться.
+    if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+        log "Обнаружен активный ssh.socket — отключаем (иначе Port игнорируется)."
+        systemctl disable --now ssh.socket 2>/dev/null \
+            || warn "disable --now ssh.socket вернул ошибку (продолжаем)"
+        sleep 1
     fi
-    err "reload не удался, пробуем restart..."
-    systemctl restart "$unit" && { log "SSH перезапущен (restart, $unit)"; return 0; }
+
+    sshd -t || { err "sshd -t не проходит. Перезапуск отменён."; return 1; }
+
+    # Рестарт надёжнее reload: он гарантированно перечитывает весь конфиг
+    # и переустанавливает listening-сокеты (важно при смене Port).
+    if systemctl restart "$unit" 2>/dev/null; then
+        log "SSH перезапущен (restart, $unit)"
+        # Ждём, пока sshd реально начнёт слушать.
+        local i
+        for i in $(seq 1 10); do
+            if pgrep -x sshd >/dev/null 2>&1; then
+                sleep 1
+                return 0
+            fi
+            sleep 0.5
+        done
+        return 0
+    fi
+
     err "Не удалось перезапустить SSH!"; return 1
 }
 
@@ -244,12 +271,14 @@ for d in /home/*/.ssh/authorized_keys; do
 done
 shopt -u nullglob
 
+# ВАЖНО: раньше проверялся только is-enabled, но ssh.socket может быть
+# активен, не будучи enabled. Поэтому проверяем оба состояния.
 CUR_SSH_SOCKET="нет"
-if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+SSH_USES_SOCKET=0
+if systemctl is-enabled --quiet ssh.socket 2>/dev/null \
+   || systemctl is-active  --quiet ssh.socket 2>/dev/null; then
     CUR_SSH_SOCKET="да (Ubuntu 22.10+/Debian 12+)"
     SSH_USES_SOCKET=1
-else
-    SSH_USES_SOCKET=0
 fi
 
 CUR_UFW_STATUS="$(ufw status 2>/dev/null | awk 'NR==1 {print $2}' || true)"
@@ -301,8 +330,6 @@ step_done
 # ============================================================
 #  Ранний выход в режиме --check
 # ============================================================
-# Всё, что нужно пользователю в режиме проверки, уже выведено выше.
-# Закрываем tee корректно, чтобы `wait` не подвис.
 if [ "$CHECK_MODE" -eq 1 ]; then
     echo ""
     info "Режим --check: анализ завершён, изменения не вносились."
@@ -591,9 +618,6 @@ else
     fi
 fi
 
-# DISABLE_PASSWORD — это ФЛАГ («отключить пароль»). В конфиге директива
-# PasswordAuthentication принимает противоположное значение: "no" для
-# отключения. Держим соответствие явно.
 if [ "$DISABLE_PASSWORD" = "yes" ]; then
     FINAL_PASSWORD_AUTH="no"
 else
@@ -670,11 +694,18 @@ if ! confirm "Применить эти изменения SSH?"; then
 fi
 
 # --- 5.7. Применение конфигурации SSH ---
-if [ -n "$NEW_SSH_PORT" ] && [ "$SSH_USES_SOCKET" -eq 1 ]; then
-    log "Отключаем ssh.socket (иначе Port в sshd_config игнорируется)..."
-    systemctl disable --now ssh.socket 2>/dev/null || warn "disable ssh.socket не удался"
+# ВАЖНО: раньше ssh.socket гасился только при смене порта. Теперь гасим
+# его всегда, если он активен/enabled — иначе reload/restart ssh.service
+# может вообще не поднять слушателя (сокет перехватит активацию), а
+# директивы Port/PasswordAuthentication в sshd_config будут игнорироваться.
+if systemctl is-enabled --quiet ssh.socket 2>/dev/null \
+   || systemctl is-active  --quiet ssh.socket 2>/dev/null; then
+    log "Отключаем ssh.socket (иначе Port/Directives в sshd_config игнорируются)..."
+    systemctl disable --now ssh.socket 2>/dev/null \
+        || warn "disable --now ssh.socket вернул ошибку"
     systemctl enable ssh.service 2>/dev/null || true
-    systemctl start ssh.service 2>/dev/null || true
+    systemctl start  ssh.service 2>/dev/null || true
+    sleep 1
 fi
 
 if [ -n "$NEW_SSH_PORT" ]; then
@@ -683,12 +714,6 @@ if [ -n "$NEW_SSH_PORT" ]; then
 fi
 
 # --- Защита от перекрытия чужими drop-in ---
-# cloud-init и некоторые дистрибутивы кладут файлы вида 50-cloud-init.conf
-# с раскомментированными директивами. Так как в OpenSSH первое значение
-# побеждает, эти файлы могут полностью обнулить наши настройки.
-# Комментируем конфликтующие директивы во всех drop-in, кроме нашего,
-# и в основном sshd_config. Регулярка допускает ведущие пробелы/табы,
-# чтобы поймать отступы вида "    Port 22".
 CONFLICT_KEYS='^[[:space:]]*(PasswordAuthentication|PermitRootLogin|PubkeyAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|AllowUsers|AllowGroups|Port)[[:space:]]'
 
 shopt -s nullglob
@@ -709,9 +734,6 @@ if grep -Eq "$CONFLICT_KEYS" "$SSHD_CONFIG"; then
 fi
 
 # --- Include в НАЧАЛО sshd_config ---
-# First Match Wins: если Include в конце файла, то все раскомментированные
-# директивы выше (MaxAuthTries, X11Forwarding и т.п.) перебьют наш drop-in.
-# Поэтому вставляем Include строго в первую строку.
 if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*' "$SSHD_CONFIG"; then
     sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' "$SSHD_CONFIG"
     info "Include добавлен в начало ${SSHD_CONFIG}"
@@ -757,6 +779,14 @@ if ! sshd -t; then
     exit 1
 fi
 log "sshd -t OK (конфиг записан, но ещё не применён)"
+
+# Проверяем, что директива Port вообще принимается в расчёт.
+EXPECT_PORT="${NEW_SSH_PORT:-${CUR_SSH_PORT}}"
+if ! sshd -T 2>/dev/null | awk -v p="$EXPECT_PORT" '$1=="port" {print $2}' | grep -qx "$EXPECT_PORT"; then
+    warn "sshd -T не показывает порт ${EXPECT_PORT}. Возможные причины:"
+    warn "  • активен ssh.socket (проверьте: systemctl status ssh.socket)"
+    warn "  • Port перекрыт другим drop-in (проверьте: grep -rns '^Port' /etc/ssh/)"
+fi
 
 # --- 5.8. Перечитываем эффективные значения ---
 ACTUAL_PASSWORD_AUTH="$(sshd_current passwordauthentication || true)"
@@ -812,9 +842,9 @@ if ufw status 2>/dev/null | grep -q "Status: active"; then
 fi
 
 ufw --force reset >/dev/null 2>&1 || true
-ufw default deny incoming
-ufw default allow outgoing
-ufw default deny routed
+ufw default deny incoming   || { err "ufw default deny incoming упал"; exit 1; }
+ufw default allow outgoing  || { err "ufw default allow outgoing упал"; exit 1; }
+ufw default deny routed     || { err "ufw default deny routed упал"; exit 1; }
 
 CURRENT_SSH_PORT=""
 if [ -n "${SSH_CONNECTION:-}" ]; then
@@ -830,20 +860,30 @@ fi
 CURRENT_SSH_PORT="${CURRENT_SSH_PORT:-22}"
 log "Текущий SSH-порт сессии: ${CURRENT_SSH_PORT}"
 
+# ВАЖНО: для SSH используем allow, а не limit. limit (6 коннектов / 30 сек)
+# может блокировать легитимные попытки при отладке и легко маскируется под
+# «порт закрыт». Rate-limit для SSH всё равно делает fail2ban.
 if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
-    ufw limit "${CURRENT_SSH_PORT}"/tcp comment 'SSH OLD (temp)'
+    ufw allow "${CURRENT_SSH_PORT}"/tcp comment 'SSH OLD (temp)' \
+        || { err "Не удалось открыть старый порт ${CURRENT_SSH_PORT}"; exit 1; }
     warn "Временно открыт старый порт ${CURRENT_SSH_PORT}."
 fi
 
-if [ -n "$NEW_SSH_PORT" ]; then
-    ufw limit "${NEW_SSH_PORT}"/tcp comment 'SSH (limited)'
-else
-    ufw limit "${CURRENT_SSH_PORT:-22}"/tcp comment 'SSH (limited)'
+FINAL_UFW_SSH_PORT="${NEW_SSH_PORT:-${CURRENT_SSH_PORT:-22}}"
+ufw allow "${FINAL_UFW_SSH_PORT}"/tcp comment 'SSH' \
+    || { err "Не удалось открыть SSH-порт ${FINAL_UFW_SSH_PORT}"; exit 1; }
+
+ufw allow 80/tcp  comment 'HTTP'      || { err "ufw allow 80 упал";  exit 1; }
+ufw allow 443/tcp comment 'HTTPS'     || { err "ufw allow 443/tcp упал"; exit 1; }
+ufw allow 443/udp comment 'QUIC/Hysteria2' || { err "ufw allow 443/udp упал"; exit 1; }
+
+# Проверяем, что правило для SSH реально появилось.
+if ! ufw status 2>/dev/null | grep -Eq "[[:space:]]${FINAL_UFW_SSH_PORT}/tcp[[:space:]]"; then
+    err "UFW не содержит правила для порта ${FINAL_UFW_SSH_PORT}. Прерываем."
+    ufw status verbose
+    exit 1
 fi
 
-ufw allow 80/tcp  comment 'HTTP'
-ufw allow 443/tcp comment 'HTTPS'
-ufw allow 443/udp comment 'QUIC/Hysteria2'
 info "Правила подготовлены. Включение — в самом конце."
 step_done
 
@@ -957,6 +997,16 @@ chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
 rkhunter --update   --nocolors >/dev/null 2>&1 || true
 rkhunter --propupd  --nocolors >/dev/null 2>&1 || true
 log "rkhunter обновлён."
+
+# Санитарная проверка, что SSH-порт реально слушается и есть в UFW.
+SANITY_PORT="${ACTUAL_SSH_PORT:-${NEW_SSH_PORT:-${CURRENT_SSH_PORT:-22}}}"
+if ! ss -tln 2>/dev/null | grep -q ":${SANITY_PORT} "; then
+    warn "sshd не слушает ожидаемый порт ${SANITY_PORT}. Проверьте sshd -T и systemctl status ssh.socket."
+fi
+if ! ufw status 2>/dev/null | grep -Eq "[[:space:]]${SANITY_PORT}/tcp[[:space:]]"; then
+    warn "UFW не содержит правила для ${SANITY_PORT}/tcp. Добавьте: ufw allow ${SANITY_PORT}/tcp"
+fi
+
 step_done
 
 # ============================================================
@@ -1005,7 +1055,7 @@ echo ""
 
 if ! confirm "Применить UFW и перезапустить SSH?"; then
     warn "Отменено. UFW выключен. Включить вручную: ufw enable"
-    warn "Перезапуск SSH: systemctl reload ssh"
+    warn "Перезапуск SSH: systemctl restart ssh"
     exit 0
 fi
 
@@ -1013,7 +1063,7 @@ fi
 #  11. Применение
 # ============================================================
 log "Применение UFW..."
-ufw --force enable
+ufw --force enable || { err "ufw enable упал"; exit 1; }
 log "UFW включён."
 
 echo ""
@@ -1023,10 +1073,40 @@ echo -e "${RED}    НЕ закрывайте эту сессию до успеш
 echo -e "${RED}============================================================${NC}"
 echo ""
 
+# Перед перезапуском фиксируем список SSH-портов, которые слушались.
+PORTS_BEFORE_RESTART="$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | tr '\n' ' ')"
+
 if service_restart_or_reload_ssh; then
     echo -e "${GREEN}✅ SSH перезапущен.${NC}"
+
+    # Даём процессу 2 секунды на открытие сокетов.
+    sleep 2
+
+    PORTS_AFTER_RESTART="$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | tr '\n' ' ')"
+    echo -e "  Слушаемые SSH-порты до рестарта:    ${PORTS_BEFORE_RESTART:-нет}"
+    echo -e "  Слушаемые SSH-порты после рестарта: ${PORTS_AFTER_RESTART:-нет}"
+
+    CHECK_PORT="${NEW_SSH_PORT:-${FINAL_PORT}}"
+    if ! ss -tln 2>/dev/null | grep -q ":${CHECK_PORT} "; then
+        err "sshd НЕ слушает порт ${CHECK_PORT} после рестарта!"
+        err "Диагностика:"
+        err "  sshd -T | grep -i '^port'"
+        err "  systemctl status ssh.socket ssh.service 2>/dev/null"
+        err "  journalctl -u ssh -u sshd --since '2 min ago' -n 50"
+        err "Старый порт в UFW НЕ будет закрыт. Перезагрузка отменена."
+        # Выходим, но без автоперезагрузки, и оставляем UFW как есть,
+        # чтобы не отрезать себе доступ.
+        exec 1>&3 2>&1
+        wait 2>/dev/null || true
+        exit 1
+    fi
+    log "sshd слушает порт ${CHECK_PORT} — OK."
 else
     echo -e "${RED}❌ SSH не перезапущен. Проверьте: sshd -t; systemctl status ssh${NC}"
+    warn "Старый порт в UFW НЕ будет закрыт."
+    exec 1>&3 2>&1
+    wait 2>/dev/null || true
+    exit 1
 fi
 echo ""
 
@@ -1034,13 +1114,31 @@ echo ""
 #  12. Закрытие старого порта
 # ============================================================
 if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
-    echo -e "${YELLOW}🔐 Старый порт ${CURRENT_SSH_PORT} открыт временно.${NC}"
-    if confirm "Проверили вход через новый порт ${FINAL_PORT}?"; then
-        ufw delete limit "${CURRENT_SSH_PORT}"/tcp >/dev/null 2>&1
-        log "Старый порт ${CURRENT_SSH_PORT} закрыт."
-        echo -e "✅ Доступен только ${FINAL_PORT}."
+    # Ещё раз убеждаемся, что новый порт реально слушается.
+    if ! ss -tln 2>/dev/null | grep -q ":${NEW_SSH_PORT} "; then
+        warn "Порт ${NEW_SSH_PORT} не слушается — старый порт НЕ закрываем."
     else
-        warn "Закрыть позже: ufw delete limit ${CURRENT_SSH_PORT}/tcp"
+        echo -e "${YELLOW}🔐 Старый порт ${CURRENT_SSH_PORT} открыт временно.${NC}"
+        if confirm "Проверили вход через новый порт ${FINAL_PORT}?"; then
+            # Ищем и удаляем правило независимо от того, allow это или limit.
+            RULE_NUM="$(ufw status numbered 2>/dev/null \
+                | awk -v p="${CURRENT_SSH_PORT}/tcp" \
+                    '/\]/ && $0 ~ p {gsub(/[^0-9]/,"",$1); print $1; exit}')"
+            if [ -n "$RULE_NUM" ]; then
+                yes | ufw delete "$RULE_NUM" >/dev/null 2>&1 \
+                    && log "Старый порт ${CURRENT_SSH_PORT} закрыт (правило #${RULE_NUM})." \
+                    || warn "Не удалось удалить правило #${RULE_NUM}. Закройте вручную: ufw delete allow ${CURRENT_SSH_PORT}/tcp"
+            else
+                # Фолбэк — пробуем оба варианта.
+                ufw delete allow "${CURRENT_SSH_PORT}"/tcp >/dev/null 2>&1 \
+                    || ufw delete limit "${CURRENT_SSH_PORT}"/tcp >/dev/null 2>&1 \
+                    || warn "Правило для старого порта не найдено."
+                log "Старый порт ${CURRENT_SSH_PORT} закрыт (фолбэк)."
+            fi
+            echo -e "✅ Доступен только ${FINAL_PORT}."
+        else
+            warn "Закрыть позже: ufw delete allow ${CURRENT_SSH_PORT}/tcp"
+        fi
     fi
 fi
 
@@ -1059,7 +1157,10 @@ echo -e "${GREEN}Спасибо!${NC}"
 #  Опциональная перезагрузка сервера.
 # ============================================================
 echo ""
-if confirm "Перезагрузить сервер сейчас? (рекомендуется для применения всех изменений)"; then
+if ! ss -tln 2>/dev/null | grep -q ":${FINAL_PORT} "; then
+    err "Отмена перезагрузки: sshd не слушает ${FINAL_PORT}."
+    err "Сначала исправьте: sshd -t; systemctl restart ssh; ss -tlnp | grep sshd"
+elif confirm "Перезагрузить сервер сейчас? (рекомендуется для применения всех изменений)"; then
     warn "Перезагрузка через 1 минуту. Отменить: shutdown -c"
     echo -e "  Команда отмены: ${GREEN}shutdown -c${NC}"
     echo ""
