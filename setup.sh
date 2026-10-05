@@ -168,7 +168,6 @@ sshd_current() {
 }
 
 # Возвращает порт, который sshd реально слушает прямо сейчас (Local Address:Port).
-# Парсим `ss -tlnp` — там Local Address в 4-м поле, фильтруем по процессу sshd.
 sshd_listening_port() {
     local p=""
     p="$(ss -tlnp 2>/dev/null \
@@ -178,8 +177,7 @@ sshd_listening_port() {
     printf '%s' "${p:-}"
 }
 
-# Проверяет, слушается ли данный TCP-порт (0.0.0.0:PORT, [::]:PORT и т.п.).
-# БЕЗ pipe в grep -q, чтобы не ловить SIGPIPE + pipefail.
+# Проверяет, слушается ли TCP-порт. Без pipe в grep -q, чтобы не ловить SIGPIPE+pipefail.
 port_is_listening() {
     local port="$1"
     local out
@@ -187,10 +185,9 @@ port_is_listening() {
     grep -q ":${port} " <<< "$out"
 }
 
-# Проверяет, сконфигурировано ли в UFW правило для данного порта/tcp.
-# ВАЖНО: `ufw status` при выключенном UFW показывает только "Status: inactive",
-# без списка правил. `ufw show added` показывает сконфигурированные правила.
-# Читаем вывод в переменную, чтобы не зависеть от pipefail + grep -q.
+# Проверяет, сконфигурировано ли в UFW правило для порта/tcp.
+# ufw status при выключенном UFW показывает только "Status: inactive",
+# поэтому используем ufw show added.
 ufw_has_rule() {
     local port="$1"
     local rules
@@ -198,14 +195,9 @@ ufw_has_rule() {
     grep -Eq "${port}/tcp([[:space:]]|$)" <<< "$rules"
 }
 
-# Универсальный детектор SSH-юнита.
-# ВАЖНО: раньше был `systemctl list-unit-files | grep -q '^ssh\.service'`.
-# При `set -o pipefail` это ломается: grep -q находит совпадение и выходит,
-# не дочитав вход; systemctl получает SIGPIPE (exit 141), и pipefail делает
-# весь pipeline неуспешным — даже если совпадение было. Поэтому обе ветки
-# if/elif проваливаются, и функция ошибочно сообщает «Не найден сервис».
-# `systemctl cat` не использует pipe и возвращает 0 ровно тогда, когда юнит
-# существует.
+# Детектор SSH-юнита. ВАЖНО: systemctl list-unit-files | grep -q ломается
+# при set -o pipefail (SIGPIPE на systemctl → pipeline неуспешен).
+# systemctl cat не использует pipe и возвращает 0 ровно тогда, когда юнит есть.
 detect_ssh_unit() {
     local candidate
     for candidate in ssh sshd; do
@@ -217,10 +209,6 @@ detect_ssh_unit() {
     return 1
 }
 
-# Перезапускает SSH. Гарантирует, что:
-#   • ssh.socket погашен (иначе Port в sshd_config игнорируется);
-#   • выполнен именно restart, а не reload;
-#   • процесс sshd действительно поднялся.
 service_restart_or_reload_ssh() {
     local unit
     unit="$(detect_ssh_unit)" || {
@@ -309,7 +297,6 @@ for d in /home/*/.ssh/authorized_keys; do
 done
 shopt -u nullglob
 
-# ssh.socket может быть активен, не будучи enabled. Проверяем оба состояния.
 CUR_SSH_SOCKET="нет"
 SSH_USES_SOCKET=0
 if systemctl is-enabled --quiet ssh.socket 2>/dev/null \
@@ -521,7 +508,6 @@ SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_DIR="/etc/ssh/sshd_config.d"
 mkdir -p "$SSHD_DIR"
 
-# Префикс 00 — сортируется раньше 50-cloud-init.conf и любых других drop-in.
 HARDENING_CONF="${SSHD_DIR}/00-hardening.conf"
 backup_file "$SSHD_CONFIG"
 
@@ -744,8 +730,7 @@ if [ -n "$NEW_SSH_PORT" ]; then
 fi
 
 # --- Защита от перекрытия чужими drop-in ---
-# ВАЖНО: разделитель в sed — '@', потому что в CONFLICT_KEYS используется
-# символ '|' как альтернация в regex. Разделитель '|' ломает sed.
+# ВАЖНО: разделитель в sed — '@', потому что в CONFLICT_KEYS используется '|'.
 CONFLICT_KEYS='^[[:space:]]*(PasswordAuthentication|PermitRootLogin|PubkeyAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|AllowUsers|AllowGroups|Port)[[:space:]]'
 
 shopt -s nullglob
@@ -878,8 +863,6 @@ ufw default deny incoming   || { err "ufw default deny incoming упал"; exit 
 ufw default allow outgoing  || { err "ufw default allow outgoing упал"; exit 1; }
 ufw default deny routed     || { err "ufw default deny routed упал"; exit 1; }
 
-# Определяем старый SSH-порт. Полагаемся на то, что реально слушает sshd
-# прямо сейчас — это и есть порт, который нужно временно оставить открытым.
 CURRENT_SSH_PORT="$(sshd_listening_port)"
 if [ -z "$CURRENT_SSH_PORT" ]; then
     CURRENT_SSH_PORT="${CUR_SSH_PORT:-}"
@@ -887,7 +870,6 @@ fi
 CURRENT_SSH_PORT="${CURRENT_SSH_PORT:-22}"
 log "Текущий SSH-порт (слушает sshd): ${CURRENT_SSH_PORT}"
 
-# Для SSH используем allow, а не limit. Rate-limit всё равно делает fail2ban.
 if [ -n "$NEW_SSH_PORT" ] && [ "$CURRENT_SSH_PORT" != "$NEW_SSH_PORT" ]; then
     ufw allow "${CURRENT_SSH_PORT}"/tcp comment 'SSH OLD (temp)' \
         || { err "Не удалось открыть старый порт ${CURRENT_SSH_PORT}"; exit 1; }
@@ -902,7 +884,6 @@ ufw allow 80/tcp  comment 'HTTP'      || { err "ufw allow 80 упал";  exit 1;
 ufw allow 443/tcp comment 'HTTPS'     || { err "ufw allow 443/tcp упал"; exit 1; }
 ufw allow 443/udp comment 'QUIC/Hysteria2' || { err "ufw allow 443/udp упал"; exit 1; }
 
-# Проверяем, что правило для SSH реально появилось.
 if ! ufw_has_rule "${FINAL_UFW_SSH_PORT}"; then
     err "UFW не содержит правила для порта ${FINAL_UFW_SSH_PORT}. Прерываем."
     echo "--- ufw show added ---"
