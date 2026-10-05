@@ -29,15 +29,10 @@ chmod +x setup.sh
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/thealekseev/vps-setup/refs/heads/main/setup.sh)
 ```
-### Проверка текущей конфигурации сервера
+## Проверка текущей конфигурации сервера
 ```bash
 sudo ./setup.sh --check
 ```
-#### Или короткий вариант:
-```bash
-sudo ./setup.sh -c
-```
-
 
 ## ⚙️ Что делает скрипт (пошагово)
 
